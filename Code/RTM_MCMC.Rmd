@@ -1,0 +1,923 @@
+---
+title: "RTM_MCMC"
+author: "Dongchen"
+date: "6/12/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Function
+```{r}
+library(hsdar)
+library(BayesianTools)
+library(rjags)
+library(coda)
+##spectral response
+#setwd("D:/Paper/509/Code")
+load("sensor.RData")
+spec.res <- function(model,sensor){
+  spec <- spectra(model)
+  rsr <- sensor.rsr[[sensor]]
+  for (i in 2:dim(rsr)[2]) {
+    rsr[,i] <- rsr[,i]/sum(rsr[,i])
+  }
+  m <- spec[rsr[,"index"]] * rsr[,-1]
+  out <- apply(m, 2, sum)
+}
+#MCMC function
+RTM_MCMC <- function(sensor, iteration, sza, vza, observed){
+  #setting parameter ranges using LAI, N, Cab, Cm, Cw, Car, Cbrown, psoil, sd parameters.
+  par_min <- c(0, 1,  5,   0,   0,  2, 0,   0,    0)
+  par_max <- c(7, 5, 60, 0.05, 0.05, 10, 4, 0.5,  0.1)
+  #Likelihood function
+  likelihood <- function(param){
+  model <- PROSAIL(LAI = param[1], N = param[2],
+                   Cab = param[3], Cm = param[4],
+                   Cw = param[5], Car = param[6],
+                   Cbrown = param[7], psoil = param[8],
+                   tts = sza, tto = vza)
+  predicted <- spec.res(model,sensor)
+  delta <- observed-predicted
+  delta[1] <- delta[1]*2
+  ll <- sum(dnorm(delta, mean = 0, sd = param[9], log = T))
+  return(ll)}
+  
+  #Prior density
+  density <- function(par){
+  return(dunif(par[1], par_min[1], par_max[1], log =T)+ #LAI
+         dunif(par[2], par_min[2], par_max[2], log =T)+ #N
+         dunif(par[3], par_min[3], par_max[3], log =T)+ #Cab
+         dunif(par[4], par_min[4], par_max[4], log =T)+ #Cm
+         dunif(par[5], par_min[5], par_max[5], log =T)+ #Cw
+         dunif(par[6], par_min[6], par_max[6], log =T)+ #Car
+         dunif(par[7], par_min[7], par_max[7], log =T)+ #Cbrown
+         dunif(par[8], par_min[8], par_max[8], log =T)+ #psoil
+         dgamma(par[9], 0.1, 0.1, log =T))}             #sd
+  
+  #Prior sampler
+  sampler <- function(n=1){
+  return(cbind(runif(n, par_min[1], par_max[1]), #LAI
+               runif(n, par_min[2], par_max[2]), #N
+               runif(n, par_min[3], par_max[3]), #Cab
+               runif(n, par_min[4], par_max[4]), #Cm
+               runif(n, par_min[5], par_max[5]), #Cw
+               runif(n, par_min[6], par_max[6]), #Car
+               runif(n, par_min[7], par_max[7]), #Cbrown
+               runif(n, par_min[8], par_max[8]), #psoil
+               rgamma(n, 0.1, 0.1)))}            #sd
+  
+  #create prior by build in function
+  prior <- createPrior(density = density, sampler = sampler)
+  #create setup
+  setup <- createBayesianSetup(likelihood, prior = prior, lower = par_min, upper = par_max)
+  settings <- list(iterations = iteration)
+  out <- runMCMC(setup, sampler = "DEzs", settings = settings)#""DREAMzs 
+  #out <- runMCMC(bayesianSetup = setup, sampler = "Metropolis", settings = settings)
+  #output
+  return(out)
+}
+
+sim_ref <- function(MCMC, sensor, sza, vza, observed){
+  param.50 <- getParam(MCMC)[[1]]
+  ref <- spec.res(PROSAIL(LAI = param.50[1], N = param.50[2],
+                   Cab = param.50[3], Cm = param.50[4],
+                   Cw = param.50[5], Car = param.50[6],
+                   Cbrown = param.50[7], psoil = param.50[8],
+                   tts = sza, tto = vza), sensor)
+  plot(ref,type="l")
+  lines(observed,col=2)
+  return(ref)
+}
+getParam <- function(MCMC){
+  data <- MCMC$Z
+  param.50 <- rep(0,9)
+  param.2.5 <- rep(0,9)
+  param.97.5 <- rep(0,9)
+  for (i in 1:9) {
+    param.50[i] <- quantile(data[,i],0.5)
+    param.2.5[i] <- quantile(data[,i],0.025)
+    param.97.5[i] <- quantile(data[,i],0.975)
+  }
+  return(list(param.50 = param.50, param.2.5 = param.2.5, param.97.5 = param.97.5))
+}
+State.space <- function(x, time, label){
+  #specify model
+  model <- "
+  model{
+    #define prior
+    tau ~ dgamma(0.1,0.1)
+    #r ~ dnorm(0.3,0.01)
+    sigma ~ dgamma(0.1,0.1)
+    x[1] ~ dnorm(0.7,0.01)
+    ### Process model for exponential growth
+    for(t in 2:N) {
+      mu[t] <- x[t-1]
+      x[t] ~ dnorm(mu[t],sigma)
+    }
+    for(t in 1:N){
+      y[t] ~ dnorm(x[t],tau)
+    }
+  }
+  "
+  data <- list(y=x, N=length(x))
+  ## initial conditions
+  nchain = 3
+  inits <- list()
+  for(i in 1:nchain){
+    inits[[i]] <- list(tau=rgamma(1,0.1,0.1), r=rnorm(1,0.5,0.05), sigma=rgamma(1,0.1,0.1))
+  }
+  j.model   <- jags.model (file = textConnection(model),
+                              data = data,
+                              inits = inits,
+                              n.chains = 3)
+  jags.out   <- coda.samples (model = j.model,
+                              variable.names = c("x"),
+                              n.iter = 100000)
+  out <- as.matrix(jags.out)
+  out1 <- matrix(0,3,length(x))
+  for (i in 1:51) {
+    out1[,i] <- quantile(out[,i],c(0.025,0.5,0.975))
+  }
+  year <- time
+  plot(year,x,col="red", xlab="DOY", ylab=label)
+  lines(year,out1[1,],col="red",lty=2)
+  lines(year,out1[2,],col="black")
+  lines(year,out1[3,],col="red",lty=2)
+  return(out1)
+}
+```
+
+#Import data
+```{r}
+#Landsat data
+#4-17
+Landsat.4.17 <- read.csv("509_Landsat/2019-04-17.csv")
+Landsat.4.17 <- Landsat.4.17[,-c(1,3,4,11:15)]
+Landsat.4.17 <- as.matrix(Landsat.4.17)
+land.sza.4.17 <- 35.660221
+
+#6-4
+Landsat.6.4 <- read.csv("509_Landsat/2019-6-4.csv")
+Landsat.6.4 <- Landsat.6.4[,-c(1,3,4,11:15)]
+Landsat.6.4 <- as.matrix(Landsat.6.4)
+land.sza.6.4 <- 25.123032
+
+#9-24
+Landsat.9.24 <- read.csv("509_Landsat/2019-9-24.csv")
+Landsat.9.24 <- Landsat.9.24[,-c(1,3,4,11:15)]
+Landsat.9.24 <- as.matrix(Landsat.9.24)
+land.sza.9.24 <- 45.126869
+
+#Sentinel-2A choose 1, 2, 3, 4, 8, 11, 12 bands
+#4-3
+Sentinel.4.3 <- read.csv("509_Sentinel/2019-4-3.csv")
+Sentinel.4.3 <- Sentinel.4.3[,c(3,6:8,12,4,5)]
+Sentinel.4.3 <- as.matrix(Sentinel.4.3)
+sent.sza.4.3 <- 39.7021
+
+#5-18
+Sentinel.5.18 <- read.csv("509_Sentinel/2019-5-18.csv")
+Sentinel.5.18 <- Sentinel.5.18[,c(3,6:8,12,4,5)]
+Sentinel.5.18 <- as.matrix(Sentinel.5.18)
+sent.sza.5.18 <- 25.7354
+
+#6-7
+Sentinel.6.7 <- read.csv("509_Sentinel/2019-6-7.csv")
+Sentinel.6.7 <- Sentinel.6.7[,c(3,6:8,12,4,5)]
+Sentinel.6.7 <- as.matrix(Sentinel.6.7)
+sent.sza.6.7 <- 23.0757
+
+#6-12
+Sentinel.6.12 <- read.csv("509_Sentinel/2019-6-12.csv")
+Sentinel.6.12 <- Sentinel.6.12[,c(3,6:8,12,4,5)]
+Sentinel.6.12 <- as.matrix(Sentinel.6.12)
+sent.sza.6.12 <- 22.8360
+
+#6-17
+Sentinel.6.17 <- read.csv("509_Sentinel/2019-6-17.csv")
+Sentinel.6.17 <- Sentinel.6.17[,c(3,6:8,12,4,5)]
+Sentinel.6.17 <- as.matrix(Sentinel.6.17)
+sent.sza.6.17 <- 22.7420
+
+#6-22
+Sentinel.6.22 <- read.csv("509_Sentinel/2019-6-22.csv")
+Sentinel.6.22 <- Sentinel.6.22[,c(3,6:8,12,4,5)]
+Sentinel.6.22 <- as.matrix(Sentinel.6.22)
+sent.sza.6.22 <- 22.8200
+
+#7-7
+Sentinel.7.7 <- read.csv("509_Sentinel/2019-7-7.csv")
+Sentinel.7.7 <- Sentinel.7.7[,c(3,6:8,12,4,5)]
+Sentinel.7.7 <- as.matrix(Sentinel.7.7)
+sent.sza.7.7 <- 23.8985
+
+#7-27
+Sentinel.7.27 <- read.csv("509_Sentinel/2019-7-27.csv")
+Sentinel.7.27 <- Sentinel.7.27[,c(3,6:8,12,4,5)]
+Sentinel.7.27 <- as.matrix(Sentinel.7.27)
+sent.sza.7.27 <- 27.0888
+
+#8-1
+Sentinel.8.1 <- read.csv("509_Sentinel/2019-8-1.csv")
+Sentinel.8.1 <- Sentinel.8.1[,c(3,6:8,12,4,5)]
+Sentinel.8.1 <- as.matrix(Sentinel.8.1)
+sent.sza.8.1 <- 28.1616
+
+#8-6
+Sentinel.8.6 <- read.csv("509_Sentinel/2019-8-6.csv")
+Sentinel.8.6 <- Sentinel.8.6[,c(3,6:8,12,4,5)]
+Sentinel.8.6 <- as.matrix(Sentinel.8.6)
+sent.sza.8.6 <- 29.3216
+
+#8-26
+Sentinel.8.26 <- read.csv("509_Sentinel/2019-8-26.csv")
+Sentinel.8.26 <- Sentinel.8.26[,c(3,6:8,12,4,5)]
+Sentinel.8.26 <- as.matrix(Sentinel.8.26)
+sent.sza.8.26 <- 34.8410
+
+#9-20
+Sentinel.9.20 <- read.csv("509_Sentinel/2019-9-20.csv")
+Sentinel.9.20 <- Sentinel.9.20[,c(3,6:8,12,4,5)]
+Sentinel.9.20 <- as.matrix(Sentinel.9.20)
+sent.sza.9.20 <- 43.2402
+
+#9-25
+Sentinel.9.25 <- read.csv("509_Sentinel/2019-9-25.csv")
+Sentinel.9.25 <- Sentinel.9.25[,c(3,6:8,12,4,5)]
+Sentinel.9.25 <- as.matrix(Sentinel.9.25)
+sent.sza.9.25 <- 45.0389
+
+#9-30
+Sentinel.9.30 <- read.csv("509_Sentinel/2019-9-30.csv")
+Sentinel.9.30 <- Sentinel.9.30[,c(3,6:8,12,4,5)]
+Sentinel.9.30 <- as.matrix(Sentinel.9.30)
+sent.sza.9.30 <- 46.8528
+
+#10-5
+Sentinel.10.5 <- read.csv("509_Sentinel/2019-10-5.csv")
+Sentinel.10.5 <- Sentinel.10.5[,c(3,6:8,12,4,5)]
+Sentinel.10.5 <- as.matrix(Sentinel.10.5)
+sent.sza.10.5 <- 48.6731
+
+#10-15
+Sentinel.10.15 <- read.csv("509_Sentinel/2019-10-15.csv")
+Sentinel.10.15 <- Sentinel.10.15[,c(3,6:8,12,4,5)]
+Sentinel.10.15 <- as.matrix(Sentinel.10.15)
+sent.sza.10.15 <- 52.2720
+
+#11-4
+Sentinel.11.4 <- read.csv("509_Sentinel/2019-11-4.csv")
+Sentinel.11.4 <- Sentinel.11.4[,c(3,6:8,12,4,5)]
+Sentinel.11.4 <- as.matrix(Sentinel.11.4)
+sent.sza.11.4 <- 58.9460
+
+#11-9
+Sentinel.11.9 <- read.csv("509_Sentinel/2019-11-9.csv")
+Sentinel.11.9 <- Sentinel.11.9[,c(3,6:8,12,4,5)]
+Sentinel.11.9 <- as.matrix(Sentinel.11.9)
+sent.sza.11.9 <- 60.4192
+
+#11-29
+Sentinel.11.29 <- read.csv("509_Sentinel/2019-11-29.csv")
+Sentinel.11.29 <- Sentinel.11.29[,c(3,6:8,12,4,5)]
+Sentinel.11.29 <- as.matrix(Sentinel.11.29)
+sent.sza.11.29 <- 65.1276
+
+#MODIS data
+Modis.4.7 <- as.matrix(read.csv("509_MODIS/2019-4-7.csv")[,c(5,7,18:24)])
+Modis.4.16 <- as.matrix(read.csv("509_MODIS/2019-4-16.csv")[,c(5,7,18:24)])
+Modis.4.24 <- as.matrix(read.csv("509_MODIS/2019-4-24.csv")[,c(5,7,18:24)])
+Modis.4.25 <- as.matrix(read.csv("509_MODIS/2019-4-25.csv")[,c(5,7,18:24)])
+Modis.4.29 <- as.matrix(read.csv("509_MODIS/2019-4-29.csv")[,c(5,7,18:24)])
+Modis.5.6 <- as.matrix(read.csv("509_MODIS/2019-5-6.csv")[,c(5,7,18:24)])
+Modis.5.8 <- as.matrix(read.csv("509_MODIS/2019-5-8.csv")[,c(5,7,18:24)])
+Modis.5.11 <- as.matrix(read.csv("509_MODIS/2019-5-11.csv")[,c(5,7,18:24)])
+Modis.5.21 <- as.matrix(read.csv("509_MODIS/2019-5-21.csv")[,c(5,7,18:24)])
+Modis.5.27 <- as.matrix(read.csv("509_MODIS/2019-5-27.csv")[,c(5,7,18:24)])
+Modis.6.28 <- as.matrix(read.csv("509_MODIS/2019-6-28.csv")[,c(5,7,18:24)])
+Modis.7.5 <- as.matrix(read.csv("509_MODIS/2019-7-5.csv")[,c(5,7,18:24)])
+Modis.7.10 <- as.matrix(read.csv("509_MODIS/2019-7-10.csv")[,c(5,7,18:24)])
+Modis.7.16 <- as.matrix(read.csv("509_MODIS/2019-7-16.csv")[,c(5,7,18:24)])
+Modis.7.21 <- as.matrix(read.csv("509_MODIS/2019-7-21.csv")[,c(5,7,18:24)])
+Modis.7.25 <- as.matrix(read.csv("509_MODIS/2019-7-25.csv")[,c(5,7,18:24)])
+Modis.8.12 <- as.matrix(read.csv("509_MODIS/2019-8-12.csv")[,c(5,7,18:24)])
+Modis.8.18 <- as.matrix(read.csv("509_MODIS/2019-8-18.csv")[,c(5,7,18:24)])
+Modis.9.7 <- as.matrix(read.csv("509_MODIS/2019-9-7.csv")[,c(5,7,18:24)])
+Modis.9.15 <- as.matrix(read.csv("509_MODIS/2019-9-15.csv")[,c(5,7,18:24)])
+Modis.10.19 <- as.matrix(read.csv("509_MODIS/2019-10-19.csv")[,c(5,7,18:24)])
+Modis.10.21 <- as.matrix(read.csv("509_MODIS/2019-10-21.csv")[,c(5,7,18:24)])
+Modis.10.24 <- as.matrix(read.csv("509_MODIS/2019-10-24.csv")[,c(5,7,18:24)])
+Modis.11.1 <- as.matrix(read.csv("509_MODIS/2019-11-1.csv")[,c(5,7,18:24)])
+Modis.11.4 <- as.matrix(read.csv("509_MODIS/2019-11-4.csv")[,c(5,7,18:24)])
+Modis.11.9 <- as.matrix(read.csv("509_MODIS/2019-11-9.csv")[,c(5,7,18:24)])
+Modis.11.13 <- as.matrix(read.csv("509_MODIS/2019-11-13.csv")[,c(5,7,18:24)])
+Modis.11.21 <- as.matrix(read.csv("509_MODIS/2019-11-21.csv")[,c(5,7,18:24)])
+Modis.11.23 <- as.matrix(read.csv("509_MODIS/2019-11-23.csv")[,c(5,7,18:24)])
+
+
+```
+
+#Landsat Realize
+```{r}
+#test Point No.20
+sensor <- "landsat8"
+iteration <- 100000
+land.vza <- 0
+land.ob <- list()
+land.sim <- list()
+#4-17
+land.ob.4.17 <- Landsat.4.17[20,]/10000
+#land.out.4.17 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = land.vza, sza = land.sza.4.17, observed = land.ob.4.17)
+#plot(land.out.4.17)
+land.ob[[1]] <- land.ob.4.17
+land.sim[[1]] <- sim_ref(Landsat[[1]],sensor,land.sza.4.17,land.vza,land.ob.4.17)
+
+#6-4
+land.ob.6.4 <- Landsat.6.4[20,]/10000
+#land.out.6.4 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = land.vza, sza = land.sza.6.4, observed = land.ob.6.4)
+#plot(land.out.6.4)
+land.ob[[2]] <- land.ob.6.4
+land.sim[[2]] <- sim_ref(Landsat[[2]],sensor,land.sza.6.4,land.vza,land.ob.6.4)
+
+#9-24
+land.ob.9.24 <- Landsat.9.24[20,]/10000
+#land.out.9.24 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = land.vza, sza = land.sza.9.24, observed = land.ob.9.24)
+#plot(land.out.9.24)
+land.ob[[3]] <- land.ob.9.24
+land.sim[[3]] <- sim_ref(Landsat[[3]],sensor,land.sza.9.24,land.vza,land.ob.9.24)
+
+#sumarize
+#Landsat <- list(land.out.4.17, land.out.6.4, land.out.9.24)
+#save(Landsat,file="Landsat.RData")
+plot(seq(0,0.7,length=100),seq(0,0.7,length=100),type="l",col="red")
+for (i in 1:3) {
+  points(land.ob[[i]],land.sim[[i]])
+}
+```
+
+#Modis Realize
+```{r}
+#test point No.20
+sensor <- "modis"
+iteration <- 100000
+Point.ID <- 20
+modi.ob <- list()
+modi.sim <- list()
+#4-7
+modi.ob.4.7 <- Modis.4.7[Point.ID,3:9]/10000
+modi.vza.4.7 <- Modis.4.7[Point.ID,1]/100
+modi.sza.4.7 <- Modis.4.7[Point.ID,2]/100
+#modi.out.4.7 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.4.7, sza = modi.sza.4.7, observed = modi.ob.4.7)
+#plot(modi.out.4.7)
+modi.sim[[1]] <- sim_ref(MODIS[[1]],sensor,modi.sza.4.7,modi.vza.4.7,modi.ob.4.7)
+modi.ob[[1]] <- modi.ob.4.7
+
+#4-16
+modi.ob.4.16 <- Modis.4.16[Point.ID,3:9]/10000
+modi.vza.4.16 <- Modis.4.16[Point.ID,1]/100
+modi.sza.4.16 <- Modis.4.16[Point.ID,2]/100
+#modi.out.4.16 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.4.16, sza = modi.sza.4.16, observed = modi.ob.4.16)
+#plot(modi.out.4.16)
+modi.sim[[2]] <- sim_ref(MODIS[[2]],sensor,modi.sza.4.16,modi.vza.4.16,modi.ob.4.16)
+modi.ob[[2]] <- modi.ob.4.16
+
+#4-24
+modi.ob.4.24 <- Modis.4.24[Point.ID,3:9]/10000
+modi.vza.4.24 <- Modis.4.24[Point.ID,1]/100
+modi.sza.4.24 <- Modis.4.24[Point.ID,2]/100
+#modi.out.4.24 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.4.24, sza = modi.sza.4.24, observed = modi.ob.4.24)
+#plot(modi.out.4.24)
+modi.sim[[3]] <- sim_ref(MODIS[[3]],sensor,modi.sza.4.24,modi.vza.4.24,modi.ob.4.24)
+modi.ob[[3]] <- modi.ob.4.24
+
+#4-25
+modi.ob.4.25 <- Modis.4.25[Point.ID,3:9]/10000
+modi.vza.4.25 <- Modis.4.25[Point.ID,1]/100
+modi.sza.4.25 <- Modis.4.25[Point.ID,2]/100
+#modi.out.4.25 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.4.25, sza = modi.sza.4.25, observed = modi.ob.4.25)
+#plot(modi.out.4.25)
+modi.sim[[4]] <- sim_ref(MODIS[[4]],sensor,modi.sza.4.25,modi.vza.4.25,modi.ob.4.25)
+modi.ob[[4]] <- modi.ob.4.25
+
+#4-29
+modi.ob.4.29 <- Modis.4.29[Point.ID,3:9]/10000
+modi.vza.4.29 <- Modis.4.29[Point.ID,1]/100
+modi.sza.4.29 <- Modis.4.29[Point.ID,2]/100
+#modi.out.4.29 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.4.29, sza = modi.sza.4.29, observed = modi.ob.4.29)
+#plot(modi.out.4.29)
+modi.sim[[5]] <- sim_ref(MODIS[[5]],sensor,modi.sza.4.29,modi.vza.4.29,modi.ob.4.29)
+modi.ob[[5]] <- modi.ob.4.29
+
+#5-6
+modi.ob.5.6 <- Modis.5.6[Point.ID,3:9]/10000
+modi.vza.5.6 <- Modis.5.6[Point.ID,1]/100
+modi.sza.5.6 <- Modis.5.6[Point.ID,2]/100
+#modi.out.5.6 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.5.6, sza = modi.sza.5.6, observed = modi.ob.5.6)
+#plot(modi.out.5.6)
+modi.sim[[6]] <- sim_ref(MODIS[[6]],sensor,modi.sza.5.6,modi.vza.5.6,modi.ob.5.6)
+modi.ob[[6]] <- modi.ob.4.7
+
+#5-8
+modi.ob.5.8 <- Modis.5.8[Point.ID,3:9]/10000
+modi.vza.5.8 <- Modis.5.8[Point.ID,1]/100
+modi.sza.5.8 <- Modis.5.8[Point.ID,2]/100
+#modi.out.5.8 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.5.8, sza = modi.sza.5.8, observed = modi.ob.5.8)
+#plot(modi.out.5.8)
+modi.sim[[7]] <- sim_ref(MODIS[[7]],sensor,modi.sza.5.8,modi.vza.5.8,modi.ob.5.8)
+modi.ob[[7]] <- modi.ob.5.8
+
+#5-11
+modi.ob.5.11 <- Modis.5.11[Point.ID,3:9]/10000
+modi.vza.5.11 <- Modis.5.11[Point.ID,1]/100
+modi.sza.5.11 <- Modis.5.11[Point.ID,2]/100
+#modi.out.5.11 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.5.11, sza = modi.sza.5.11, observed = modi.ob.5.11)
+#plot(modi.out.5.11)
+modi.sim[[8]] <- sim_ref(MODIS[[8]],sensor,modi.sza.5.11,modi.vza.5.11,modi.ob.5.11)
+modi.ob[[8]] <- modi.ob.5.11
+
+#5-21
+modi.ob.5.21 <- Modis.5.21[Point.ID,3:9]/10000
+modi.vza.5.21 <- Modis.5.21[Point.ID,1]/100
+modi.sza.5.21 <- Modis.5.21[Point.ID,2]/100
+#modi.out.5.21 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.5.21, sza = modi.sza.5.21, observed = modi.ob.5.21)
+#plot(modi.out.5.21)
+modi.sim[[9]] <- sim_ref(MODIS[[9]],sensor,modi.sza.5.21,modi.vza.5.21,modi.ob.5.21)
+modi.ob[[9]] <- modi.ob.5.21
+
+#5-27
+modi.ob.5.27 <- Modis.5.27[Point.ID,3:9]/10000
+modi.vza.5.27 <- Modis.5.27[Point.ID,1]/100
+modi.sza.5.27 <- Modis.5.27[Point.ID,2]/100
+#modi.out.5.27 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.5.27, sza = modi.sza.5.27, observed = modi.ob.5.27)
+#plot(modi.out.5.27)
+modi.sim[[10]] <- sim_ref(MODIS[[10]],sensor,modi.sza.5.27,modi.vza.5.27,modi.ob.5.27)
+modi.ob[[10]] <- modi.ob.5.27
+
+#6-28
+modi.ob.6.28 <- Modis.6.28[Point.ID,3:9]/10000
+modi.vza.6.28 <- Modis.6.28[Point.ID,1]/100
+modi.sza.6.28 <- Modis.6.28[Point.ID,2]/100
+#modi.out.6.28 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.6.28, sza = modi.sza.6.28, observed = modi.ob.6.28)
+#plot(modi.out.6.28)
+modi.sim[[11]] <- sim_ref(MODIS[[11]],sensor,modi.sza.6.28,modi.vza.6.28,modi.ob.6.28)
+modi.ob[[11]] <- modi.ob.6.28
+
+#7-5
+modi.ob.7.5 <- Modis.7.5[Point.ID,3:9]/10000
+modi.vza.7.5 <- Modis.7.5[Point.ID,1]/100
+modi.sza.7.5 <- Modis.7.5[Point.ID,2]/100
+#modi.out.7.5 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.7.5, sza = modi.sza.7.5, observed = modi.ob.7.5)
+#plot(modi.out.7.5)
+modi.sim[[12]] <- sim_ref(MODIS[[12]],sensor,modi.sza.7.5,modi.vza.7.5,modi.ob.7.5)
+modi.ob[[12]] <- modi.ob.7.5
+
+#7-10
+modi.ob.7.10 <- Modis.7.10[Point.ID,3:9]/10000
+modi.vza.7.10 <- Modis.7.10[Point.ID,1]/100
+modi.sza.7.10 <- Modis.7.10[Point.ID,2]/100
+#modi.out.7.10 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.7.10, sza = modi.sza.7.10, observed = modi.ob.7.10)
+#plot(modi.out.7.10)
+modi.sim[[13]] <- sim_ref(MODIS[[13]],sensor,modi.sza.7.10,modi.vza.7.10,modi.ob.7.10)
+modi.ob[[13]] <- modi.ob.7.10
+
+#7-16
+modi.ob.7.16 <- Modis.7.16[Point.ID,3:9]/10000
+modi.vza.7.16 <- Modis.7.16[Point.ID,1]/100
+modi.sza.7.16 <- Modis.7.16[Point.ID,2]/100
+#modi.out.7.16 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.7.16, sza = modi.sza.7.16, observed = modi.ob.7.16)
+#plot(modi.out.7.16)
+modi.sim[[14]] <- sim_ref(MODIS[[14]],sensor,modi.sza.7.16,modi.vza.7.16,modi.ob.7.16)
+modi.ob[[14]] <- modi.ob.7.16
+
+#7-21
+modi.ob.7.21 <- Modis.7.21[Point.ID,3:9]/10000
+modi.vza.7.21 <- Modis.7.21[Point.ID,1]/100
+modi.sza.7.21 <- Modis.7.21[Point.ID,2]/100
+#modi.out.7.21 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.7.21, sza = modi.sza.7.21, observed = modi.ob.7.21)
+#plot(modi.out.7.21)
+modi.sim[[15]] <- sim_ref(MODIS[[15]],sensor,modi.sza.7.21,modi.vza.7.21,modi.ob.7.21)
+modi.ob[[15]] <- modi.ob.7.21
+
+#7-25
+modi.ob.7.25 <- Modis.7.25[Point.ID,3:9]/10000
+modi.vza.7.25 <- Modis.7.25[Point.ID,1]/100
+modi.sza.7.25 <- Modis.7.25[Point.ID,2]/100
+#modi.out.7.25 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.7.25, sza = modi.sza.7.25, observed = modi.ob.7.25)
+#plot(modi.out.7.25)
+modi.sim[[16]] <- sim_ref(MODIS[[16]],sensor,modi.sza.7.25,modi.vza.7.25,modi.ob.7.25)
+modi.ob[[16]] <- modi.ob.7.25
+
+#8-12
+modi.ob.8.12 <- Modis.8.12[Point.ID,3:9]/10000
+modi.vza.8.12 <- Modis.8.12[Point.ID,1]/100
+modi.sza.8.12 <- Modis.8.12[Point.ID,2]/100
+#modi.out.8.12 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.8.12, sza = modi.sza.8.12, observed = modi.ob.8.12)
+#plot(modi.out.8.12)
+modi.sim[[17]] <- sim_ref(MODIS[[17]],sensor,modi.sza.8.12,modi.vza.8.12,modi.ob.8.12)
+modi.ob[[17]] <- modi.ob.8.12
+
+#8-18
+modi.ob.8.18 <- Modis.8.18[Point.ID,3:9]/10000
+modi.vza.8.18 <- Modis.8.18[Point.ID,1]/100
+modi.sza.8.18 <- Modis.8.18[Point.ID,2]/100
+#modi.out.8.18 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.8.18, sza = modi.sza.8.18, observed = modi.ob.8.18)
+#plot(modi.out.8.18)
+modi.sim[[18]] <- sim_ref(MODIS[[18]],sensor,modi.sza.8.18,modi.vza.8.18,modi.ob.8.18)
+modi.ob[[18]] <- modi.ob.8.18
+
+#9-7
+modi.ob.9.7 <- Modis.9.7[Point.ID,3:9]/10000
+modi.vza.9.7 <- Modis.9.7[Point.ID,1]/100
+modi.sza.9.7 <- Modis.9.7[Point.ID,2]/100
+#modi.out.9.7 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.9.7, sza = modi.sza.9.7, observed = modi.ob.9.7)
+#plot(modi.out.9.7)
+modi.sim[[19]] <- sim_ref(MODIS[[19]],sensor,modi.sza.9.7,modi.vza.9.7,modi.ob.9.7)
+modi.ob[[19]] <- modi.ob.9.7
+
+#9-15
+modi.ob.9.15 <- Modis.9.15[Point.ID,3:9]/10000
+modi.vza.9.15 <- Modis.9.15[Point.ID,1]/100
+modi.sza.9.15 <- Modis.9.15[Point.ID,2]/100
+#modi.out.9.15 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.9.15, sza = modi.sza.9.15, observed = modi.ob.9.15)
+#plot(modi.out.9.15)
+modi.sim[[20]] <- sim_ref(MODIS[[20]],sensor,modi.sza.9.15,modi.vza.9.15,modi.ob.9.15)
+modi.ob[[20]] <- modi.ob.9.15
+
+#10-19
+modi.ob.10.19 <- Modis.10.19[Point.ID,3:9]/10000
+modi.vza.10.19 <- Modis.10.19[Point.ID,1]/100
+modi.sza.10.19 <- Modis.10.19[Point.ID,2]/100
+#modi.out.10.19 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.10.19, sza = modi.sza.10.19, observed = modi.ob.10.19)
+#plot(modi.out.10.19)
+modi.sim[[21]] <- sim_ref(MODIS[[21]],sensor,modi.sza.10.19,modi.vza.10.19,modi.ob.10.19)
+modi.ob[[21]] <- modi.ob.10.19
+
+#10-21
+modi.ob.10.21 <- Modis.10.21[Point.ID,3:9]/10000
+modi.vza.10.21 <- Modis.10.21[Point.ID,1]/100
+modi.sza.10.21 <- Modis.10.21[Point.ID,2]/100
+#modi.out.10.21 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.10.21, sza = modi.sza.10.21, observed = modi.ob.10.21)
+#plot(modi.out.10.21)
+modi.sim[[22]] <- sim_ref(MODIS[[22]],sensor,modi.sza.10.21,modi.vza.10.21,modi.ob.10.21)
+modi.ob[[22]] <- modi.ob.10.21
+
+#10-24
+modi.ob.10.24 <- Modis.10.24[Point.ID,3:9]/10000
+modi.vza.10.24 <- Modis.10.24[Point.ID,1]/100
+modi.sza.10.24 <- Modis.10.24[Point.ID,2]/100
+#modi.out.10.24 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.10.24, sza = modi.sza.10.24, observed = modi.ob.10.24)
+#plot(modi.out.10.24)
+modi.sim[[23]] <- sim_ref(MODIS[[23]],sensor,modi.sza.10.24,modi.vza.10.24,modi.ob.10.24)
+modi.ob[[23]] <- modi.ob.10.24
+
+#11-1
+modi.ob.11.1 <- Modis.11.1[Point.ID,3:9]/10000
+modi.vza.11.1 <- Modis.11.1[Point.ID,1]/100
+modi.sza.11.1 <- Modis.11.1[Point.ID,2]/100
+#modi.out.11.1 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.11.1, sza = modi.sza.11.1, observed = modi.ob.11.1)
+#plot(modi.out.11.1)
+modi.sim[[24]] <- sim_ref(MODIS[[24]],sensor,modi.sza.11.1,modi.vza.11.1,modi.ob.11.1)
+modi.ob[[24]] <- modi.ob.11.1
+
+#11-4
+modi.ob.11.4 <- Modis.11.4[Point.ID,3:9]/10000
+modi.vza.11.4 <- Modis.11.4[Point.ID,1]/100
+modi.sza.11.4 <- Modis.11.4[Point.ID,2]/100
+#modi.out.11.4 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.11.4, sza = modi.sza.11.4, observed = modi.ob.11.4)
+#plot(modi.out.11.4)
+modi.sim[[25]] <- sim_ref(MODIS[[25]],sensor,modi.sza.11.4,modi.vza.11.4,modi.ob.11.4)
+modi.ob[[25]] <- modi.ob.11.4
+
+#11-9
+modi.ob.11.9 <- Modis.11.9[Point.ID,3:9]/10000
+modi.vza.11.9 <- Modis.11.9[Point.ID,1]/100
+modi.sza.11.9 <- Modis.11.9[Point.ID,2]/100
+#modi.out.11.9 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.11.9, sza = modi.sza.11.9, observed = modi.ob.11.9)
+#plot(modi.out.11.9)
+modi.sim[[26]] <- sim_ref(MODIS[[26]],sensor,modi.sza.11.9,modi.vza.11.9,modi.ob.11.9)
+modi.ob[[26]] <- modi.ob.11.9
+
+#11-13
+modi.ob.11.13 <- Modis.11.13[Point.ID,3:9]/10000
+modi.vza.11.13 <- Modis.11.13[Point.ID,1]/100
+modi.sza.11.13 <- Modis.11.13[Point.ID,2]/100
+#modi.out.11.13 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.11.13, sza = modi.sza.11.13, observed = modi.ob.11.13)
+#plot(modi.out.11.13)
+modi.sim[[27]] <- sim_ref(MODIS[[27]],sensor,modi.sza.11.13,modi.vza.11.13,modi.ob.11.13)
+modi.ob[[27]] <- modi.ob.11.13
+
+#11-21
+modi.ob.11.21 <- Modis.11.21[Point.ID,3:9]/10000
+modi.vza.11.21 <- Modis.11.21[Point.ID,1]/100
+modi.sza.11.21 <- Modis.11.21[Point.ID,2]/100
+#modi.out.11.21 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.11.21, sza = modi.sza.11.21, observed = modi.ob.11.21)
+#plot(modi.out.11.21)
+modi.sim[[28]] <- sim_ref(MODIS[[28]],sensor,modi.sza.11.21,modi.vza.11.21,modi.ob.11.21)
+modi.ob[[28]] <- modi.ob.11.21
+
+#11-23
+modi.ob.11.23 <- Modis.11.23[Point.ID,3:9]/10000
+modi.vza.11.23 <- Modis.11.23[Point.ID,1]/100
+modi.sza.11.23 <- Modis.11.23[Point.ID,2]/100
+#modi.out.11.23 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = modi.vza.11.23, sza = modi.sza.11.23, observed = modi.ob.11.23)
+#plot(modi.out.11.23)
+modi.sim[[29]] <- sim_ref(MODIS[[29]],sensor,modi.sza.11.23,modi.vza.11.23,modi.ob.11.23)
+modi.ob[[29]] <- modi.ob.11.23
+
+#summarize
+#MODIS <- list(modi.out.4.7,modi.out.4.16,modi.out.4.24,modi.out.4.25,modi.out.4.29,modi.out.5.6,modi.out.5.8,modi.out.5.11,modi.out.5.21,modi.out.5.27,modi.out.6.28,modi.out.7.5,modi.out.7.10,modi.out.7.16,modi.out.7.21,modi.out.7.25,modi.out.8.12,modi.out.8.18,modi.out.9.7,modi.out.9.15,modi.out.10.19,modi.out.10.21,modi.out.10.24,modi.out.11.1,modi.out.11.4,modi.out.11.9,modi.out.11.13,modi.out.11.21,modi.out.11.23)
+#save(MODIS,file="MODIS.RData")
+plot(seq(0,0.6,length=100),seq(0,0.6,length=100),type="l",col="red")
+for (i in 1:29) {
+  points(modi.ob[[i]],modi.sim[[i]])
+}
+```
+
+#Sentinel Realize
+```{r}
+#test point No.20
+sensor <- "sentinel.2A"
+iteration <- 100000
+sent.vza <- 3.5
+sent.ob <- list()
+sent.sim <- list()
+#4-3
+sent.ob.4.3 <- Sentinel.4.3[20,]/10000
+#sent.out.4.3 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = sent.vza, sza = sent.sza.4.3, observed = sent.ob.4.3)
+#plot(sent.out.4.3)
+sent.sim[[1]] <- sim_ref(Sentinel[[1]],sensor,sent.sza.4.3,sent.vza,sent.ob.4.3)
+sent.ob[[1]] <- sent.ob.4.3
+
+#5-18
+sent.ob.5.18 <- Sentinel.5.18[20,]/10000
+#sent.out.5.18 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = sent.vza, sza = sent.sza.5.18, observed = sent.ob.5.18)
+#plot(sent.out.5.18)
+sent.sim[[2]] <- sim_ref(Sentinel[[2]],sensor,sent.sza.5.18,sent.vza,sent.ob.5.18)
+sent.ob[[2]] <- sent.ob.5.18
+
+#6-7
+sent.ob.6.7 <- Sentinel.6.7[20,]/10000
+#sent.out.6.7 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = sent.vza, sza = sent.sza.6.7, observed = sent.ob.6.7)
+#plot(sent.out.6.7)
+sent.sim[[3]] <- sim_ref(Sentinel[[3]],sensor,sent.sza.6.7,sent.vza,sent.ob.6.7)
+sent.ob[[3]] <- sent.ob.6.7
+
+#6-12
+sent.ob.6.12 <- Sentinel.6.12[20,]/10000
+#sent.out.6.12 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = sent.vza, sza = sent.sza.6.12, observed = sent.ob.6.12)
+#plot(sent.out.6.12)
+sent.sim[[4]] <- sim_ref(Sentinel[[4]],sensor,sent.sza.6.12,sent.vza,sent.ob.6.12)
+sent.ob[[4]] <- sent.ob.6.12
+
+#6-17
+sent.ob.6.17 <- Sentinel.6.17[20,]/10000
+#sent.out.6.17 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = sent.vza, sza = sent.sza.6.17, observed = sent.ob.6.17)
+#plot(sent.out.6.17)
+sent.sim[[5]] <- sim_ref(Sentinel[[5]],sensor,sent.sza.6.17,sent.vza,sent.ob.6.17)
+sent.ob[[5]] <- sent.ob.6.17
+
+#6-22
+sent.ob.6.22 <- Sentinel.6.22[20,]/10000
+#sent.out.6.22 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = sent.vza, sza = sent.sza.6.22, observed = sent.ob.6.22)
+#plot(sent.out.6.22)
+sent.sim[[6]] <- sim_ref(Sentinel[[6]],sensor,sent.sza.6.22,sent.vza,sent.ob.6.22)
+sent.ob[[6]] <- sent.ob.6.22
+
+#7-7
+sent.ob.7.7 <- Sentinel.7.7[20,]/10000
+#sent.out.7.7 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = sent.vza, sza = sent.sza.7.7, observed = sent.ob.7.7)
+#plot(sent.out.7.7)
+sent.sim[[7]] <- sim_ref(Sentinel[[7]],sensor,sent.sza.7.7,sent.vza,sent.ob.7.7)
+sent.ob[[7]] <- sent.ob.7.7
+
+#7-27
+sent.ob.7.27 <- Sentinel.7.27[20,]/10000
+#sent.out.7.27 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = sent.vza, sza = sent.sza.7.27, observed = sent.ob.7.27)
+#plot(sent.out.7.27)
+sent.sim[[8]] <- sim_ref(Sentinel[[8]],sensor,sent.sza.7.27,sent.vza,sent.ob.7.27)
+sent.ob[[8]] <- sent.ob.7.27
+
+#8-1
+sent.ob.8.1 <- Sentinel.8.1[20,]/10000
+#sent.out.8.1 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = sent.vza, sza = sent.sza.8.1, observed = sent.ob.8.1)
+#plot(sent.out.8.1)
+sent.sim[[9]] <- sim_ref(Sentinel[[9]],sensor,sent.sza.8.1,sent.vza,sent.ob.8.1)
+sent.ob[[9]] <- sent.ob.8.1
+
+#8-6
+sent.ob.8.6 <- Sentinel.8.6[20,]/10000
+#sent.out.8.6 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = sent.vza, sza = sent.sza.8.6, observed = sent.ob.8.6)
+#plot(sent.out.8.6)
+sent.sim[[10]] <- sim_ref(Sentinel[[10]],sensor,sent.sza.8.6,sent.vza,sent.ob.8.6)
+sent.ob[[10]] <- sent.ob.8.6
+
+#8-26
+sent.ob.8.26 <- Sentinel.8.26[20,]/10000
+#sent.out.8.26 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = sent.vza, sza = sent.sza.8.26, observed = sent.ob.8.26)
+#plot(sent.out.8.26)
+sent.sim[[11]] <- sim_ref(Sentinel[[11]],sensor,sent.sza.8.26,sent.vza,sent.ob.8.26)
+sent.ob[[11]] <- sent.ob.8.26
+
+#9-20
+sent.ob.9.20 <- Sentinel.9.20[20,]/10000
+#sent.out.9.20 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = sent.vza, sza = sent.sza.9.20, observed = sent.ob.9.20)
+#plot(sent.out.9.20)
+sent.sim[[12]] <- sim_ref(Sentinel[[12]],sensor,sent.sza.9.20,sent.vza,sent.ob.9.20)
+sent.ob[[12]] <- sent.ob.9.20
+
+#9-25
+sent.ob.9.25 <- Sentinel.9.25[20,]/10000
+#sent.out.9.25 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = sent.vza, sza = sent.sza.9.25, observed = sent.ob.9.25)
+#plot(sent.out.9.25)
+sent.sim[[13]] <- sim_ref(Sentinel[[13]],sensor,sent.sza.9.25,sent.vza,sent.ob.9.25)
+sent.ob[[13]] <- sent.ob.9.25
+
+#9-30
+sent.ob.9.30 <- Sentinel.9.30[20,]/10000
+#sent.out.9.30 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = sent.vza, sza = sent.sza.9.30, observed = sent.ob.9.30)
+#plot(sent.out.9.30)
+sent.sim[[14]] <- sim_ref(Sentinel[[14]],sensor,sent.sza.9.30,sent.vza,sent.ob.9.30)
+sent.ob[[14]] <- sent.ob.9.30
+
+#10-5
+sent.ob.10.5 <- Sentinel.10.5[20,]/10000
+#sent.out.10.5 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = sent.vza, sza = sent.sza.10.5, observed = sent.ob.10.5)
+#plot(sent.out.10.5)
+sent.sim[[15]] <- sim_ref(Sentinel[[15]],sensor,sent.sza.10.5,sent.vza,sent.ob.10.5)
+sent.ob[[15]] <- sent.ob.10.5
+
+#10-15
+sent.ob.10.15 <- Sentinel.10.15[20,]/10000
+#sent.out.10.15 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = sent.vza, sza = sent.sza.10.15, observed = sent.ob.10.15)
+#plot(sent.out.10.15)
+sent.sim[[16]] <- sim_ref(Sentinel[[16]],sensor,sent.sza.10.15,sent.vza,sent.ob.10.15)
+sent.ob[[16]] <- sent.ob.10.15
+
+#11-4
+sent.ob.11.4 <- Sentinel.11.4[20,]/10000
+#sent.out.11.4 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = sent.vza, sza = sent.sza.11.4, observed = sent.ob.11.4)
+#plot(sent.out.11.4)
+sent.sim[[17]] <- sim_ref(Sentinel[[17]],sensor,sent.sza.11.4,sent.vza,sent.ob.11.4)
+sent.ob[[17]] <- sent.ob.11.4
+
+#11-9
+sent.ob.11.9 <- Sentinel.11.9[20,]/10000
+#sent.out.11.9 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = sent.vza, sza = sent.sza.11.9, observed = sent.ob.11.9)
+#plot(sent.out.11.9)
+sent.sim[[18]] <- sim_ref(Sentinel[[18]],sensor,sent.sza.11.9,sent.vza,sent.ob.11.9)
+sent.ob[[18]] <- sent.ob.11.9
+
+#11-29
+sent.ob.11.29 <- Sentinel.11.29[20,]/10000
+#sent.out.11.29 <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = sent.vza, sza = sent.sza.11.29, observed = sent.ob.11.29)
+#plot(sent.out.11.29)
+sent.sim[[19]] <- sim_ref(Sentinel[[19]],sensor,sent.sza.11.29,sent.vza,sent.ob.11.29)
+sent.ob[[19]] <- sent.ob.11.29
+
+#summarize
+#Sentinel <- list(sent.out.4.3, sent.out.5.18, sent.out.6.7, sent.out.6.12, sent.out.6.17, sent.out.6.22, sent.out.7.7, sent.out.7.27, sent.out.8.1, sent.out.8.6, sent.out.8.26, sent.out.9.20, sent.out.9.25, sent.out.9.30, sent.out.10.5, sent.out.10.15, sent.out.11.4, sent.out.11.9, sent.out.11.29)
+#save(Sentinel,file="Sentinel.RData")
+plot(seq(0,0.6,length=100),seq(0,0.6,length=100),type="l",col="red")
+for (i in 1:19) {
+  points(sent.ob[[i]],sent.sim[[i]])
+}
+```
+
+#Result analysis
+```{r}
+#parameter
+#Landsat
+load(file = "Landsat.RData")
+Landsat.param <- list()
+for (i in 1:3) {
+  Landsat.param[[i]] <- getParam(Landsat[[i]])
+}
+#Sentinel
+load(file = "Sentinel.RData")
+Sentinel.param <- list()
+for (i in 1:19) {
+  Sentinel.param[[i]] <- getParam(Sentinel[[i]])
+}
+#MODIS
+load(file = "MODIS.RData")
+MODIS.param <- list()
+for (i in 1:29) {
+  MODIS.param[[i]] <- getParam(MODIS[[i]])
+}
+#summarize
+#LAI, N, Cab, Cm, Cw, Car, Cbrown, psoil, sd
+all.param <- list(Sentinel.param[[1]], MODIS.param[[1]], MODIS.param[[2]], Landsat.param[[1]], MODIS.param[[3]], MODIS.param[[4]], MODIS.param[[5]], MODIS.param[[6]], MODIS.param[[7]], MODIS.param[[8]], Sentinel.param[[2]], MODIS.param[[9]], MODIS.param[[10]], Landsat.param[[2]], Sentinel.param[[3]], Sentinel.param[[4]], Sentinel.param[[5]], Sentinel.param[[6]], MODIS.param[[11]], MODIS.param[[12]], Sentinel.param[[7]], MODIS.param[[13]], MODIS.param[[14]], MODIS.param[[15]], MODIS.param[[16]], Sentinel.param[[8]], Sentinel.param[[9]], Sentinel.param[[10]], MODIS.param[[17]], MODIS.param[[18]], Sentinel.param[[11]], MODIS.param[[19]], MODIS.param[[20]], Sentinel.param[[12]], Landsat.param[[3]], Sentinel.param[[13]], Sentinel.param[[14]], Sentinel.param[[15]], Sentinel.param[[16]], MODIS.param[[21]], MODIS.param[[22]], MODIS.param[[23]], MODIS.param[[24]], MODIS.param[[25]], Sentinel.param[[17]], Sentinel.param[[18]], MODIS.param[[26]], MODIS.param[[27]], MODIS.param[[28]], MODIS.param[[29]], Sentinel.param[[19]])
+#LAI, N, Cab, Cm, Cw, Car, Cbrown, psoil
+#LAI
+LAI <- matrix(0,51,3)
+for (i in 1:51) {
+  LAI[i,1] <- all.param[[i]]$param.50[1] 
+  LAI[i,2] <- all.param[[i]]$param.2.5[1]
+  LAI[i,3] <- all.param[[i]]$param.97.5[1] 
+}
+plot(LAI[,3],type="l",col=2, ylim=c(0,7))
+lines(LAI[,2],col=2)
+lines(LAI[,1],col=1)
+#N
+N <- matrix(0,51,3)
+for (i in 1:51) {
+  N[i,1] <- all.param[[i]]$param.50[2] 
+  N[i,2] <- all.param[[i]]$param.2.5[2]
+  N[i,3] <- all.param[[i]]$param.97.5[2] 
+}
+plot(N[,3],type="l",col=2,ylim=c(1,5))
+lines(N[,2],col=2)
+lines(N[,1],col=1)
+#Cab
+Cab <- matrix(0,51,3)
+for (i in 1:51) {
+  Cab[i,1] <- all.param[[i]]$param.50[3] 
+  Cab[i,2] <- all.param[[i]]$param.2.5[3]
+  Cab[i,3] <- all.param[[i]]$param.97.5[3] 
+}
+plot(Cab[,3],type="l",col=2,ylim=c(0,60))
+lines(Cab[,2],col=2)
+lines(Cab[,1],col=1)
+
+#Cm
+Cm <- matrix(0,51,3)
+for (i in 1:51) {
+  Cm[i,1] <- all.param[[i]]$param.50[4] 
+  Cm[i,2] <- all.param[[i]]$param.2.5[4]
+  Cm[i,3] <- all.param[[i]]$param.97.5[4] 
+}
+plot(Cm[,3],type="l",col=2,ylim=c(0,0.06))
+lines(Cm[,2],col=2)
+lines(Cm[,1],col=1)
+
+#Cw
+Cw <- matrix(0,51,3)
+for (i in 1:51) {
+  Cw[i,1] <- all.param[[i]]$param.50[5] 
+  Cw[i,2] <- all.param[[i]]$param.2.5[5]
+  Cw[i,3] <- all.param[[i]]$param.97.5[5] 
+}
+plot(Cw[,3],type="l",col=2,ylim=c(0,0.06))
+lines(Cw[,2],col=2)
+lines(Cw[,1],col=1)
+
+#Car
+Car <- matrix(0,51,3)
+for (i in 1:51) {
+  Car[i,1] <- all.param[[i]]$param.50[6] 
+  Car[i,2] <- all.param[[i]]$param.2.5[6]
+  Car[i,3] <- all.param[[i]]$param.97.5[6] 
+}
+plot(Car[,3],type="l",col=2,ylim=c(0,10))
+lines(Car[,2],col=2)
+lines(Car[,1],col=1)
+
+#Cbrown
+Cbrown <- matrix(0,51,3)
+for (i in 1:51) {
+  Cbrown[i,1] <- all.param[[i]]$param.50[7] 
+  Cbrown[i,2] <- all.param[[i]]$param.2.5[7]
+  Cbrown[i,3] <- all.param[[i]]$param.97.5[7] 
+}
+plot(Cbrown[,3],type="l",col=2,ylim=c(0,4))
+lines(Cbrown[,2],col=2)
+lines(Cbrown[,1],col=1)
+
+#psoil
+psoil <- matrix(0,51,3)
+for (i in 1:51) {
+  psoil[i,1] <- all.param[[i]]$param.50[8] 
+  psoil[i,2] <- all.param[[i]]$param.2.5[8]
+  psoil[i,3] <- all.param[[i]]$param.97.5[8] 
+}
+plot(psoil[,3],type="l",col=2,ylim=c(0,0.5))
+lines(psoil[,2],col=2)
+lines(psoil[,1],col=1)
+
+```
+
+#State space model
+```{r}
+#define time intervals
+DOY <- c(93, 97, 106, 107, 114, 115, 119,           #Apr
+         126, 128, 131, 138, 141, 147,              #May
+         155, 158, 163, 168, 173, 179,              #June
+         186, 188, 191, 197, 202, 206, 208,         #July
+         213, 218, 224, 230, 236,                   #Aug
+         250, 258, 263, 267, 268, 273,              #Sep
+         278, 288, 292, 294, 297,                   #Oct
+         305, 308, 308, 313, 313, 317, 325, 327, 333)#Nov
+
+LAI.random.walk <- State.space(LAI[,1], DOY, label = "LAI")
+N.random.walk <- State.space(N[,1], DOY, label = "N")
+Cab.random.walk <- State.space(Cab[,1], DOY, label = "Cab")
+Cm.random.walk <- State.space(Cm[,1]*100, DOY, label = "Cm")
+Cw.random.walk <- State.space(Cw[,1]*100, DOY, label = "Cw")
+Car.random.walk <- State.space(Car[,1], DOY, label = "Car")
+Cbrown.random.walk <- State.space(Cbrown[,1], DOY, label = "Cbrown")
+psoil.random.walk <- State.space(psoil[,1], DOY, label = "psoil")
+```
+

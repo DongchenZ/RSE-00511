@@ -1,0 +1,965 @@
+---
+title: "OutputResult"
+author: "Dongchen Zhang"
+date: "10/29/2020"
+output: html_document
+---
+#main function
+```{r}
+library(hsdar)
+library(BayesianTools)
+library(rjags)
+library(coda)
+library(TDPanalysis)
+
+##spectral response
+setwd("/Users/dongchenzhang/Desktop/Learning/Michael/Code")
+load("sensor.RData")
+spec.res <- function(model,sensor){
+  spec <- spectra(model)
+  rsr <- sensor.rsr[[sensor]]
+  for (i in 2:dim(rsr)[2]) {
+    rsr[,i] <- rsr[,i]/sum(rsr[,i])
+  }
+  m <- spec[rsr[,"index"]] * rsr[,-1]
+  out <- apply(m, 2, sum)
+}
+#MCMC function
+RTM_MCMC <- function(sensor, iteration, sza, vza, observed){
+  #setting parameter ranges using LAI, N, Cab, Cm, Cw, Car, Cbrown, psoil, sd parameters.
+  par_min <- c(0, 1,  5,   0,   0,  5, 0,   0,    0)
+  par_max <- c(7, 5, 60, 0.05, 0.05, 7, 4, 0.00001,  0.1)
+  #Likelihood function
+  likelihood <- function(param){
+  model <- PROSAIL(LAI = param[1], N = param[2],
+                   Cab = param[3], Cm = param[4],
+                   Cw = param[5], Car = param[6],
+                   Cbrown = param[7], psoil = param[8],
+                   tts = sza, tto = vza)
+  predicted <- spec.res(model,sensor)
+  delta <- observed-predicted
+  #delta[1] <- delta[1]*2
+  ll <- sum(dnorm(delta, mean = 0, sd = param[9], log = T))
+  return(ll)}
+  
+  #Prior density
+  density <- function(par){
+  return(dunif(par[1], par_min[1], par_max[1], log =T)+ #LAI
+         dunif(par[2], par_min[2], par_max[2], log =T)+ #N
+         dunif(par[3], par_min[3], par_max[3], log =T)+ #Cab
+         dunif(par[4], par_min[4], par_max[4], log =T)+ #Cm
+         dunif(par[5], par_min[5], par_max[5], log =T)+ #Cw
+         dunif(par[6], par_min[6], par_max[6], log =T)+ #Car
+         dunif(par[7], par_min[7], par_max[7], log =T)+ #Cbrown
+         dunif(par[8], par_min[8], par_max[8], log =T)+ #psoil
+         dgamma(par[9], 0.1, 0.1, log =T))}             #sd
+  
+  #Prior sampler
+  sampler <- function(n=1){
+  return(cbind(runif(n, par_min[1], par_max[1]), #LAI
+               runif(n, par_min[2], par_max[2]), #N
+               runif(n, par_min[3], par_max[3]), #Cab
+               runif(n, par_min[4], par_max[4]), #Cm
+               runif(n, par_min[5], par_max[5]), #Cw
+               runif(n, par_min[6], par_max[6]), #Car
+               runif(n, par_min[7], par_max[7]), #Cbrown
+               runif(n, par_min[8], par_max[8]), #psoil
+               rgamma(n, 0.1, 0.1)))}            #sd
+  
+  #create prior by build in function
+  prior <- createPrior(density = density, sampler = sampler)
+  #create setup
+  setup <- createBayesianSetup(likelihood, prior = prior, lower = par_min, upper = par_max)
+  settings <- list(iterations = iteration)
+  out <- runMCMC(setup, sampler = "DEzs", settings = settings)#""DREAMzs 
+  #out <- runMCMC(bayesianSetup = setup, sampler = "Metropolis", settings = settings)
+  #output
+  return(out)
+}
+#get simulated reflectance
+sim_ref <- function(MCMC, sensor, sza, vza, observed){
+  param.50 <- getParam(MCMC)[[1]]
+  ref <- spec.res(PROSAIL(LAI = param.50[1], N = param.50[2],
+                   Cab = param.50[3], Cm = param.50[4],
+                   Cw = param.50[5], Car = param.50[6],
+                   Cbrown = param.50[7], psoil = param.50[8],
+                   tts = sza, tto = vza), sensor)
+  #plot(ref,type="l")
+  #lines(observed,col=2)
+  return(ref)
+}
+#get confidential breaks of param
+getParam <- function(MCMC){
+  data <- MCMC$Z
+  param.50 <- rep(0,9)
+  param.2.5 <- rep(0,9)
+  param.97.5 <- rep(0,9)
+  param.var <- rep(0,9)
+  for (i in 1:9) {
+    param.50[i] <- quantile(data[,i],0.5)
+    param.2.5[i] <- quantile(data[,i],0.025)
+    param.97.5[i] <- quantile(data[,i],0.975)
+    param.var[i] <- var(data[,i])
+  }
+  return(list(param.50 = param.50, param.2.5 = param.2.5, param.97.5 = param.97.5, param.var = param.var))
+}
+#Random walk model with obs.err
+State.space1 <- function(x, time, label, sensor.name, obs.err){ #, obs.err ????
+  #specify model
+  model <- "
+  model{
+    #define prior
+    #tau ~ dgamma(0.1,0.1)
+    #r ~ dnorm(0.3,0.01)
+    sigma ~ dgamma(0.1,0.1)
+    x[1] ~ dnorm(0.7,0.01)
+    ### Process model for exponential growth
+    for(t in 2:N) {
+      mu[t] <- x[t-1]
+      x[t] ~ dnorm(mu[t],sigma)
+    }
+    for(t in 1:N){
+      y[t] ~ dnorm(x[t],tau[t])
+    }
+  }
+  "
+  data <- list(y=x, N=length(x), tau=obs.err)
+  L <- length(x)
+  ## initial conditions
+  nchain = 3
+  inits <- list()
+  for(i in 1:nchain){
+    inits[[i]] <- list(sigma=rgamma(1,0.1,0.1))
+  }
+  j.model   <- jags.model (file = textConnection(model),
+                              data = data,
+                              inits = inits,
+                              n.chains = 3)
+  jags.out   <- coda.samples (model = j.model,
+                              variable.names = c("x"),
+                              n.iter = 100000)
+  out <- as.matrix(jags.out)
+  out1 <- matrix(0,3,length(x))
+  for (i in 1:L) {
+    out1[,i] <- quantile(out[,i],c(0.025,0.5,0.975))
+  }
+  return(out1)
+}
+
+#Random walk model
+State.space <- function(x, time, n.iter){ #, obs.err ????
+  #specify model
+  model <- "
+  model{
+    #define prior
+    tau ~ dgamma(0.1,0.1)
+    #r ~ dnorm(0.3,0.01)
+    sigma ~ dgamma(0.1,0.1)
+    x[1] ~ dnorm(0.7,0.01)
+    ### Process model for exponential growth
+    for(t in 2:N) {
+      mu[t] <- x[t-1]
+      x[t] ~ dnorm(mu[t],sigma)
+    }
+    for(t in 1:N){
+      y[t] ~ dnorm(x[t],tau)
+    }
+  }
+  "
+  data <- list(y=x, N=length(x))
+  L <- length(x)
+  ## initial conditions
+  nchain = 3
+  inits <- list()
+  for(i in 1:nchain){
+    inits[[i]] <- list(tau=rgamma(1,0.1,0.1), sigma=rgamma(1,0.1,0.1))
+  }
+  j.model   <- jags.model (file = textConnection(model),
+                              data = data,
+                              inits = inits,
+                              n.chains = 3)
+  jags.out   <- coda.samples (model = j.model,
+                              variable.names = c("x"),
+                              n.iter = n.iter)
+  out <- as.matrix(jags.out)
+  out1 <- matrix(0,3,length(x))
+  for (i in 1:L) {
+    out1[,i] <- quantile(out[,i],c(0.025,0.5,0.975))
+  }
+  return(out1)
+}
+#import data by folder name
+Read.csv.RS <- function(Folder.name, Bands.name, Sensor.type){
+  current.path <- getwd()
+  folder.name <- list.files(pattern = Folder.name)
+  setwd(folder.name)
+  Date <- list.files(pattern="*.csv")
+  Data.list <- list()
+  for (i in 1:length(Date)) {
+    Data <- read.csv(Date[i])#Read file
+    Data.list[[i]] <- list(Date = strsplit(Date[i],".csv")[[1]], 
+                           Reflectance = as.matrix(Data[,Bands.name]), Sensor = Sensor.type)
+  }
+  setwd(current.path)
+  return(Data.list)
+}
+#sort date
+Sort.name.by.date <- function(string){
+  Date <- as.Date(string)
+  sorted.Date <- sort(Date)
+  uniq <- unique(sorted.Date)
+  L1 <- length(uniq)
+  Index <- rep(-1,length(string))
+  k <- 1
+  for (i in 1:L1) {
+    position <- which(Date == uniq[i])
+    for (j in 1:length(position)) {
+      Index[k] <- position[j]
+      k <- k + 1
+    }
+  }
+  return(Index)
+}
+#sort data by date
+Sort.data.by.date <- function(data.list){
+  L <- length(data.list)
+  data.name <- rep(0,L)
+  for (i in 1:L) {
+    data.name[i] <- data.list[[i]]$Date
+  }
+  Index <- Sort.name.by.date(data.name)
+  new.data.list <- list()
+  for (i in 1:L) {
+    new.data.list[[i]] <- data.list[[Index[i]]]
+  }
+  return(new.data.list)
+}
+
+Combine.Diff.Data.Sorces <- function(Data.list){
+  All.Data.list <- list()
+  L1 <- length(Data.list)
+  count <- 1
+  for (i in 1:L1) {
+    L2 <- length(Data.list[[i]])
+    for (j in 1:L2) {
+      All.Data.list[[count]] <- Data.list[[i]][[j]]
+      count <- count + 1
+    }
+  }
+  new.Data.list <- Sort.data.by.date(All.Data.list)
+  return(new.Data.list)
+}
+#Main function
+#Main function
+Main.Fun <- function(All.Data.list, iteration, PointID, DateID, Cloud.Status){
+  L1 <- length(DateID)
+  L2 <- length(PointID)
+  out <- list()
+  for (i in 1:L1) {
+    Data.list <- All.Data.list[[DateID[i]]]
+    print(paste("i =",i))
+    print(Data.list$file.name)
+    print(Data.list$Sensor)
+    out1 <- list()
+    for (j in 1:L2) {
+      print(paste("Point.ID =",PointID[j]))
+      #cloud detection
+      if(Cloud.Status[[DateID[i]]]$cloud.type[PointID[j]]!="clear"){
+        next
+      }
+      
+      if(Data.list$Sensor == "modis"){
+        #imput parameters
+        Reflectance <- Data.list$Reflectance[PointID[j],3:9]/10000
+        sza <- Data.list$Reflectance[PointID[j],2]/100
+        vza <- Data.list$Reflectance[PointID[j],1]/100
+        sensor <- "modis"
+        #Run MCMC
+        #MCMC <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = vza, sza = sza, observed = Reflectance)
+        flag <- is.na(try(MCMC <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = vza, sza = sza, observed = Reflectance)))
+        while (flag[1]) {
+          flag <- is.na(try(MCMC <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = vza, sza = sza, observed = Reflectance)))
+          print("error")
+        }
+        #output contains: parameters' estimation, sensor type, simulated ref, observed ref
+        out1[[j]] <- list(Param.est = getParam(MCMC),
+                        sensor = sensor,
+                        sim.ref = sim_ref(MCMC, sensor, sza, vza, Reflectance),
+                        obs.ref = Reflectance,
+                        Date = Data.list$file.name,
+                        Real.dat = MCMC$Z)
+      }
+      if(Data.list$Sensor != "modis"){
+        Reflectance <- Data.list$Reflectance[PointID[j],]/10000
+        sensor <- Data.list$Sensor
+        sza <- Data.list$solar.zenith
+        vza <- Data.list$sensor.zenith
+        #MCMC <- RTM_MCMC(sensor = sensor, iteration = iteration, sza = sza, vza = vza, Reflectance)
+        flag <- is.na(try(MCMC <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = vza, sza = sza, observed = Reflectance)))
+        while (flag[1]) {
+          flag <- is.na(try(MCMC <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = vza, sza = sza, observed = Reflectance)))
+          print("error")
+        }
+        #output contains: parameters' estimation, sensor type, simulated ref, observed ref
+        out1[[j]] <- list(Param.est = getParam(MCMC),
+                        sensor = Data.list$Sensor,
+                        sim.ref = sim_ref(MCMC, sensor, sza, vza, Reflectance),
+                        obs.ref = Reflectance,
+                        Date = Data.list$file.name,
+                        Real.dat = MCMC$Z)
+      }
+    }
+    out[[i]] <- list(Data = out1)
+    
+  }
+  
+  return(out)
+}
+Create.time.points <- function(data.list){
+  L <- length(data.list)
+  DOY <- rep(NA,L)
+  for (i in 1:L) {
+    temp <- data.list[[i]]$Date
+    temp <- gsub("-","/",temp)
+    DOY[i] <- date.to.DOY(temp,format = "yyyy/mm/dd")
+  }
+  start.DOY <- floor(DOY[1]/10)*10
+  end.DOY <- ceiling(DOY[L]/10)*10
+  time.span <- end.DOY - start.DOY + 1
+  time.points <- rep(NA, time.span)
+  DOY <- DOY-start.DOY
+  time.points[DOY] <- 1
+  out <- list(time.points = time.points, start.DOY = start.DOY, end.DOY = end.DOY)
+  return(out)
+}
+main.random.walk <- function(MCMC.list, param.name, time.points){
+  ref.param.name <- c("LAI", "N", "Cab", "Cm", "Cw", "Car", "Cbrown", "psoil", "sd")
+  index <- which(ref.param.name==param.name)
+  L <- length(MCMC.list)
+  L1 <- length(time.points$time.points)
+  real.time <- which(time.points$time.points==1)
+  time <- time.points$start.DOY:time.points$end.DOY
+  param.var <- rep(NA,L1)
+  sensor.name <- rep(NA,L1)
+  param <- rep(NA,L1)
+  for (i in 1:L) {
+    param[real.time[i]] <- MCMC.list[[i]]$Param.est[[1]][index]
+    sensor.name[real.time[i]] <- MCMC.list[[i]]$sensor
+    param.var[real.time[i]] <- 1/MCMC.list[[i]]$Param.est[[4]][index]
+  }
+  if(is.na(param.var[1]))param.var[1] <- param.var[which(!is.na(param.var))[1]]
+  for (i in 2:L1) {
+    if(is.na(param.var[i])){
+      param.var[i] <- param.var[i-1]
+      next
+    }
+  }
+  
+  #preprocess data
+  if(max(param,na.rm = T)<=1 && max(param,na.rm = T)>0.1){
+    param <- param*10
+    param.var <- param.var/100
+    param.name <- paste(sep = "",param.name,"*10^(-1)")
+  }
+  if(max(param,na.rm = T)<=0.1){
+    param <- param*100
+    param.var <- param.var/10000
+    param.name <- paste(sep = "",param.name,"*10^(-2)")
+  }
+  out <- State.space1(x=param, time=time, label=param.name, obs.err=param.var)#, obs.err=sd ???
+  #handle different sensor
+  uni.sensor <- na.omit(unique(sensor.name))
+  L2 <- length(uni.sensor)
+  param2 <- list()
+  time2 <- list()
+  for (i in 1:L2) {
+    param2[[i]] <- param[which(sensor.name==uni.sensor[i])]
+    time2[[i]] <- time[which(sensor.name==uni.sensor[i])]
+  }
+  test <- param[which(sensor.name==uni.sensor[2])]
+  y.min <- min(out)
+  y.max <- max(out)
+  #plot
+  plot(time2[[1]],param2[[1]],ylab=param.name,xlab="DOY",ylim=c(y.min,y.max),col=1,pch=19)
+  points(time2[[2]],param2[[2]],col=2,pch=19)
+  points(time2[[3]],param2[[3]],col=3,pch=19)
+  lines(time,out[1,],col="red",lty=2)
+  lines(time,out[2,],col="black")
+  lines(time,out[3,],col="red",lty=2)
+  #legend(x=min(time),y=y.max,col=c(1,2,3),pch=rep(19,3),legend = c(uni.sensor[1],uni.sensor[2],uni.sensor[3]),cex = 0.8)
+  return(out)
+}
+remove.same.date <- function(data.list){
+  L <- length(data.list)
+  date.var <- rep("",L)
+  for (i in 1:L) {
+    date.var[i] <- as.Date(data.list[[i]]$Date)
+  }
+  uniq <- unique(date.var)
+  L1 <- length(uniq)
+  pos <- rep(0,L1)
+  for (i in 1:L1) {
+    pos1 <- which(date.var==uniq[i])
+    if(length(pos1)>1){
+      pos[i] <- pos1[1]
+    }else{
+      pos[i] <- pos1
+    }
+  }
+  new.data.list <- data.list[pos]
+}
+box.plot <- function(MCMC.list, param.name, time.points){
+  ref.param.name <- c("LAI", "N", "Cab", "Cm", "Cw", "Car", "Cbrown", "psoil", "sd")
+  index <- which(ref.param.name==param.name)
+  real.DOY <- time.points$start.DOY + which(time.points$time.points==1) - 1
+  L1 <- length(MCMC.list)
+  L2 <- dim(MCMC.list[[1]]$Real.dat)[1]
+  param <- matrix(NA,L1*L2,2)
+  for (i in 1:L1) {
+    dat <- MCMC.list[[i]]$Real.dat[,index]
+    start <- (i-1)*L2+1
+    end <- i*L2
+    param[start:end,1] <- real.DOY[i]
+    param[start:end,2] <- dat
+  }
+  colnames(param) <- c("DOY","Param")
+  boxplot(Param~DOY,param,outline=F,ylab=param.name,xlab="DOY")
+  return(param)
+}
+```
+
+#Function
+```{r}
+getMCMC.list <- function(Dat,All.data.list,rm.sameDOY=TRUE){
+  MCMC.list <- list()
+  for (i in 1:length(Dat)) {
+    if(length(Dat[[i]]$Data)!=0){
+      MCMC.list[[i]] <- Dat[[i]]$Data[[1]]
+      MCMC.list[[i]]$Date <- All.data.list[[i]]$file.name
+    }
+  }
+  #remove NULL in a list
+  MCMC.list <- MCMC.list[-(which(sapply(MCMC.list,is.null),arr.ind=TRUE))]
+  #Remove same date(1, 7, )
+  if(rm.sameDOY){
+    MCMC.list <- remove.same.date(MCMC.list)
+  }
+  #output
+  MCMC.list
+}
+
+simple.Ref.Com <- function(MCMC.list){
+  plot(MCMC.list[[1]]$sim.ref,MCMC.list[[1]]$obs.ref,xlim=c(0,0.5),ylim=c(0,0.5),xlab="Simulated Reflectance",ylab="Observed Reflectance")
+  for (i in 1:length(MCMC.list)) {
+    points(MCMC.list[[i]]$sim.ref,MCMC.list[[i]]$obs.ref)
+  }
+  lines(seq(0,1,length=100),seq(0,1,length=100),lwd=1.5,col=2)
+}
+
+Ref.conf <- function(real.param, sza, vza){
+  Full.Spectra <- matrix(0,dim(real.param)[1],length(spectra(PROSAIL())))
+  for (i in 1:dim(real.param)[1]) {
+    param <- real.param[i,]
+    Full.Spectra[i,] <- spectra(PROSAIL(LAI = param[1], N = param[2],
+                   Cab = param[3], Cm = param[4],
+                   Cw = param[5], Car = param[6],
+                   Cbrown = param[7], psoil = param[8],
+                   tts = sza, tto = vza))
+    if(i%%10000==0)print(i)
+  }
+  Ref.Con <- matrix(0,3,length(spectra(PROSAIL())))
+  for (i in 1:dim(Ref.Con)[2]) {
+    temp.spectra <- Full.Spectra[,i]
+    Ref.Con[,i] <- quantile(temp.spectra,c(0.025,0.5,0.975))
+  }
+  Spectral.range <- 400:1200
+  x <- Spectral.range
+  y1 <- Ref.Con[1,1:length(Spectral.range)]
+  y2 <- Ref.Con[3,1:length(Spectral.range)]
+  y3 <- Ref.Con[2,1:length(Spectral.range)]
+  plot(Spectral.range,y2,type="l",col=1, xlab="Wavelength",ylab="Reflectance",ylim=c(0,max(y2)))
+  polygon(c(x, rev(x)), c(y1, rev(y2)), col="gray")
+  lines(Spectral.range,y3,lty=1,col=2,lwd=3)
+  lines(Spectral.range,y1,lty=2,col=1)
+  Ref.Con
+}
+
+#correlation heat map
+CorHeatMap <- function(matrix){
+  cor <- cor(matrix)
+  melted_cormat <- melt(cor)
+  ggplot(data = melted_cormat, aes(x=Var1, y=Var2, fill=value)) + 
+    geom_tile(color = "white")+
+    scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+    midpoint = 0, limit = c(-1,1), space = "Lab", 
+    name="Correlation") +
+    theme_minimal()+ 
+    theme(axis.title.x = element_blank(), axis.title.y = element_blank())+
+    coord_fixed()
+  
+}
+```
+
+```{r}
+load("/Users/dongchenzhang/Desktop/Learning/Michael/Code/Reulst_Data/Point20.RData")
+load("AllData.RData")
+MCMC.list <- getMCMC.list(Dat.20,All.data.list)
+
+
+#Random walk model
+time.points <- Create.time.points(MCMC.list)
+N.Random.walk <- main.random.walk(MCMC.list,"N",time.points)
+LAI.Random.walk <-  main.random.walk(MCMC.list,"LAI",time.points)
+Cab.Random.walk <-  main.random.walk(MCMC.list,"Cab",time.points)
+Cm.Random.walk <-  main.random.walk(MCMC.list,"Cm",time.points)
+Cw.Random.walk <-  main.random.walk(MCMC.list,"Cw",time.points)
+Car.Random.walk <-  main.random.walk(MCMC.list,"Car",time.points)
+Cbrown.Random.walk <-  main.random.walk(MCMC.list,"Cbrown",time.points)
+psoil.Random.walk <- main.random.walk(MCMC.list,"psoil",time.points)
+
+
+#LAI validation
+LAI.ground <- read.csv("hf069-01-lai-plot.csv")
+ID <- c("D1","D2", "D3", "D4", "D5", 
+        "C2", "C3", "C4", "C5", 
+        "B2", "B3", "B4", "B5", 
+        "A2", "A3", "A4", "A5")
+ID <- unique(LAI.ground[which(LAI.ground$year==2018),]$plot)
+Year <- 2018
+LAI.plot <- function(PointID, Year){
+  temp.dat <- LAI.ground[which(LAI.ground$year==Year),]
+  temp.dat1 <- data.frame(matrix(NA,1,8))
+  colnames(temp.dat1) <- colnames(temp.dat)
+  for (i in 1:length(PointID)) {
+    temp.dat1 <- rbind(temp.dat1, temp.dat[which(temp.dat$plot==PointID[i]),])
+  }
+  temp.dat1 <- temp.dat1[-1,]
+  Uni.doy <- unique(temp.dat1$doy)
+  temp.dat2 <- rep(NA,length(Uni.doy))
+  for (i in 1:length(Uni.doy)) {
+    temp.dat2[i] <- mean(temp.dat1[which(temp.dat1$doy==Uni.doy[i]),]$lai)
+  }
+  plot(Uni.doy,temp.dat2,ylim=c(0,6),type="l")
+  rbind(temp.dat2,Uni.doy)
+}
+test <- LAI.plot("A1",Year)
+plot(90:340, LAI.Random.walk[1,],type="l",col=2, ylim=c(min(LAI.Random.walk),max(LAI.Random.walk)),lty=2,xlab="DOY",ylab="LAI")
+lines(90:340, LAI.Random.walk[2,],col=1)
+lines(90:340, LAI.Random.walk[3,],col=2,lty=2)
+points(test[2,],test[1,],col=3,pch=19)
+legend(x=83,y=max(LAI.Random.walk)+0.1,col=c(2,1,3),pch=c(NA,NA,19),lty=c(2,1,NA),legend = c("CI","Median","Ground Truth"),cex = 0.8)
+```
+
+```{r}
+#Check on reflectance
+simple.Ref.Com(MCMC.list)
+Geomtry <- All.data.list[[2]]
+test <- Ref.conf(MCMC.list[[1]]$Real.dat, Geomtry$Reflectance[20,2]/100, Geomtry$Reflectance[20,1]/100)
+plot(test[1,],type="l",col=1,ylim=c(0,max(test)))
+lines(test[2,],col=2)
+lines(test[3,],col=1)
+
+Geomtry <- All.data.list[[13]]
+test <- Ref.conf(MCMC.list[[10]]$Real.dat, Geomtry$Reflectance[20,2]/100, Geomtry$Reflectance[20,1]/100)
+plot(test[1,],type="l",col=1,ylim=c(0,max(test)))
+lines(test[2,],col=2)
+lines(test[3,],col=1)
+
+Geomtry <- All.data.list[[29]]
+test <- Ref.conf(MCMC.list[[22]]$Real.dat, Geomtry$Reflectance[20,2]/100, Geomtry$Reflectance[20,1]/100)
+plot(test[1,],type="l",col=1,ylim=c(0,max(test)))
+lines(test[2,],col=2)
+lines(test[3,],col=1)
+
+Geomtry <- All.data.list[[38]]
+test <- Ref.conf(MCMC.list[[30]]$Real.dat, Geomtry$Reflectance[20,2]/100, Geomtry$Reflectance[20,1]/100)
+plot(test[1,],type="l",col=1,ylim=c(0,max(test)))
+lines(test[2,],col=2)
+lines(test[3,],col=1)
+
+Geomtry <- All.data.list[[52]]
+test <- Ref.conf(MCMC.list[[42]]$Real.dat, Geomtry$Reflectance[20,2]/100, Geomtry$Reflectance[20,1]/100)
+plot(test[1,],type="l",col=1,ylim=c(0,max(test)))
+lines(test[2,],col=2)
+lines(test[3,],col=1)
+
+Geomtry <- All.data.list[[63]]
+test <- Ref.conf(MCMC.list[[51]]$Real.dat, Geomtry$Reflectance[20,2]/100, Geomtry$Reflectance[20,1]/100)
+plot(test[1,],type="l",col=1,ylim=c(0,max(test)))
+lines(test[2,],col=2)
+lines(test[3,],col=1)
+
+Geomtry <- All.data.list[[75]]
+test <- Ref.conf(MCMC.list[[61]]$Real.dat, Geomtry$Reflectance[20,2]/100, Geomtry$Reflectance[20,1]/100)
+plot(test[1,],type="l",col=1,ylim=c(0,max(test)))
+lines(test[2,],col=2)
+lines(test[3,],col=1)
+
+Geomtry <- All.data.list[[89]]
+test <- Ref.conf(MCMC.list[[71]]$Real.dat, Geomtry$Reflectance[20,2]/100, Geomtry$Reflectance[20,1]/100)
+plot(test[1,],type="l",col=1,ylim=c(0,max(test)))
+lines(test[2,],col=2)
+lines(test[3,],col=1)
+```
+
+
+```{r}
+#create correlation matrix map
+#seasonality changes
+library("PerformanceAnalytics")
+library(LaplacesDemon)
+library(ggplot2)
+library(reshape2)
+
+#load data
+load("/Users/dongchenzhang/Desktop/Learning/Michael/Code/Reulst_Data/Point20.RData")
+load("AllData.RData")
+
+#get correlation matrix
+MCMC.list.remv <- getMCMC.list(Dat.20,All.data.list,TRUE)
+Corr.list <- list()
+var.name <- c("LAI", "N", "Cab", "Cm", "Cw", "Car", "Cbrown", "psoil")
+for (i in 1:length(MCMC.list.remv)) {
+  Posterior <- MCMC.list.remv[[i]]$Real.dat
+  Thined.posterior <- Thin(Posterior, By=100)[,1:8]
+  colnames(Thined.posterior) <- var.name
+  corr.matrix <- matrix(CorHeatMap(Thined.posterior)$data$value,nrow = 8,ncol = 8,byrow = T)
+  rownames(corr.matrix) <- var.name
+  colnames(corr.matrix) <- var.name
+  Corr.list[[i]] <- list(correlation=corr.matrix,dat=MCMC.list.remv[[i]]$Date)
+}
+
+#get random walk results and display them
+time.points <- Create.time.points(MCMC.list.remv)
+
+#single run
+#Check time-series correlation between LAI and Cab
+#therefore, the position in matrix should be (1,3)
+#(1,4),(5,8)
+#positive: Cw & N; LAI & Cm; Cbrown & N; Soil & LAI; Cw & N;
+#Negative: Cw & Cm; Cw & LAI;
+#complete run for all correlations
+Comp.corr <- list()
+L1 <- time.points$end.DOY-time.points$start.DOY+1
+L <- length(MCMC.list.remv)
+real.time <- which(time.points$time.points==1)
+for (i in 1:length(var.name)) {
+  for (j in i:length(var.name)) {
+    #calculate correlation between ith and jth element
+    #get correlations for a single run
+    #calculate ID for the overall output list
+    ID <- (i-1)*length(var.name)+j
+    
+    #get time-series data for this single run
+    TS.data <- rep(NA,length(Corr.list))
+    for (k in 1:length(Corr.list)) {
+      TS.data[k] <- Corr.list[[k]]$correlation[i,j]
+    }
+    
+    #get real.dat
+    Real.dat <- rep(NA,L1)
+    for (k in 1:L) {
+      Real.dat[real.time[k]] <- TS.data[k]
+    }
+    
+    #do state space - random walk model
+    Comp.corr[[ID]] <- list(out=State.space(x=Real.dat, time=time, n.iter = 10000),
+                            Real.dat=Real.dat)
+  }
+  print(i)
+}
+time <- time.points$start.DOY:time.points$end.DOY
+Corr.plot.fun <- function(Comp.corr, var.name1, var.name2){
+  #get index and 
+  var.name <- c("LAI", "N", "Cab", "Cm", "Cw", "Car", "Cbrown", "psoil")
+  i <- which(var.name==var.name1)
+  j <- which(var.name==var.name2)
+  ID <- (i-1)*length(var.name)+j
+  out <- Comp.corr[[ID]]$out
+  Real.dat <- Comp.corr[[ID]]$Real.dat
+  
+  #plot
+  plot(time,Real.dat,ylim=c(-1,1),ylab="Correlation",main=paste("TS Correlation Plot Between",var.name1,"and",var.name2),xlab="DOY")
+  lines(time,out[3,],col=2)
+  lines(time,out[2,],col=3)
+  lines(time,out[1,],col=2)
+  abline(h=0,col=2,lwd=2)
+}
+Corr.plot.fun(Comp.corr, "LAI", "N")
+
+#Seasonal averaged results
+#Spring(3/1-5/31); Summer(6/1-8/31); Autumn(9/1-11-30); Winter(12/1-2/28)
+#DOY: ~ - 151;    152-243;           244-334;           335- ~ 
+# dates = c("05/31/2019", "06/01/2019","08/31/2019","09/01/2019","11/30/2019","12/01/2019")
+# date.to.DOY(dates = dates,format = "mm/dd/yyyy")
+Seasonal.Corr <- list()
+for (i in 1:length(Comp.corr)) {
+  Seasonal.Corr[[i]] <- list(Spring = Comp.corr[[i]]$out[2,1:(151-time.points$start.DOY+1)],
+                             Summer = Comp.corr[[i]]$out[2,(151-time.points$start.DOY+2):(243-time.points$start.DOY+1)],
+                             Autumn = Comp.corr[[i]]$out[2,(243-time.points$start.DOY+2):(335-time.points$start.DOY+1)],
+                             Winter = Comp.corr[[i]]$out[2,(335-time.points$start.DOY+2):length(Comp.corr[[i]]$out[2,])])
+}
+
+#make box plot for different season in r
+season.box.plot <- function(Seasonal.corr, var.name1, var.name2){
+  #get index
+  var.name <- c("LAI", "N", "Cab", "Cm", "Cw", "Car", "Cbrown", "psoil")
+  ID <- (which(var.name==var.name1)-1)*length(var.name)+which(var.name==var.name2)
+  
+  #compose data.frame
+  temp.spring <- Seasonal.corr[[ID]]$Spring
+  temp.summer <- Seasonal.corr[[ID]]$Summer
+  temp.autumn <- Seasonal.corr[[ID]]$Autumn
+  temp.winter <- Seasonal.corr[[ID]]$Winter
+  
+  L <- c(length(temp.spring), length(temp.summer), length(temp.autumn), length(temp.winter))
+  Final.data.frame <- as.data.frame(matrix(NA, sum(L), 2))
+  Final.data.frame[,1] <- c(temp.spring,
+                            temp.summer,
+                            temp.autumn,
+                            temp.winter)
+  Label <- c(rep("Spring",L[1]),
+             rep("Summer",L[2]),
+             rep("Autumn",L[3]),
+             rep("Winter",L[4]))
+  
+  Final.data.frame[,2] <- Label
+  colnames(Final.data.frame) <- c("Correlation", "Season")
+  Final.data.frame$Season <- factor(Final.data.frame$Season, levels = c("Spring","Summer","Autumn","Winter"))
+  boxplot(Correlation~Season,data=Final.data.frame, main=paste("Seasonal Correlation Between",var.name1,"and",var.name2))
+  Final.data.frame
+}
+test <- season.box.plot(Seasonal.Corr, "LAI","Cab")
+#c("LAI", "N", "Cab", "Cm", "Cw", "Car", "Cbrown", "psoil")
+```
+
+
+```{r}
+#prior and posterior distributions
+#LAI
+LAI.prior.dis <- runif(10000,0,7)
+LAI.posterior.dis <- MCMC.list[[1]]$Real.dat[,1]
+LAI.prior.dataframe <- data.frame(Type=factor(c(rep("Prior",10000),rep("Posterior",length(LAI.posterior.dis)))),
+                                  LAI=c(LAI.prior.dis,LAI.posterior.dis))
+ggplot(LAI.prior.dataframe, aes(x=LAI, fill=Type)) + geom_density(alpha=.3)
+
+#
+LAI.posterior.dis <- MCMC.list[[10]]$Real.dat[,1]
+LAI.prior.dataframe <- data.frame(Type=factor(c(rep("Prior",10000),rep("Posterior",length(LAI.posterior.dis)))),
+                                  LAI=c(LAI.prior.dis,LAI.posterior.dis))
+ggplot(LAI.prior.dataframe, aes(x=LAI, fill=Type)) + geom_density(alpha=.3)
+
+#
+LAI.posterior.dis <- MCMC.list[[22]]$Real.dat[,1]
+LAI.prior.dataframe <- data.frame(Type=factor(c(rep("Prior",10000),rep("Posterior",length(LAI.posterior.dis)))),
+                                  LAI=c(LAI.prior.dis,LAI.posterior.dis))
+ggplot(LAI.prior.dataframe, aes(x=LAI, fill=Type)) + geom_density(alpha=.3)
+
+#
+LAI.posterior.dis <- MCMC.list[[30]]$Real.dat[,1]
+LAI.prior.dataframe <- data.frame(Type=factor(c(rep("Prior",10000),rep("Posterior",length(LAI.posterior.dis)))),
+                                  LAI=c(LAI.prior.dis,LAI.posterior.dis))
+ggplot(LAI.prior.dataframe, aes(x=LAI, fill=Type)) + geom_density(alpha=.3)
+
+#
+LAI.posterior.dis <- MCMC.list[[42]]$Real.dat[,1]
+LAI.prior.dataframe <- data.frame(Type=factor(c(rep("Prior",10000),rep("Posterior",length(LAI.posterior.dis)))),
+                                  LAI=c(LAI.prior.dis,LAI.posterior.dis))
+ggplot(LAI.prior.dataframe, aes(x=LAI, fill=Type)) + geom_density(alpha=.3)
+
+#
+LAI.posterior.dis <- MCMC.list[[51]]$Real.dat[,1]
+LAI.prior.dataframe <- data.frame(Type=factor(c(rep("Prior",10000),rep("Posterior",length(LAI.posterior.dis)))),
+                                  LAI=c(LAI.prior.dis,LAI.posterior.dis))
+ggplot(LAI.prior.dataframe, aes(x=LAI, fill=Type)) + geom_density(alpha=.3)
+
+#
+LAI.posterior.dis <- MCMC.list[[61]]$Real.dat[,1]
+LAI.prior.dataframe <- data.frame(Type=factor(c(rep("Prior",10000),rep("Posterior",length(LAI.posterior.dis)))),
+                                  LAI=c(LAI.prior.dis,LAI.posterior.dis))
+ggplot(LAI.prior.dataframe, aes(x=LAI, fill=Type)) + geom_density(alpha=.3)
+
+#
+LAI.posterior.dis <- MCMC.list[[71]]$Real.dat[,1]
+LAI.prior.dataframe <- data.frame(Type=factor(c(rep("Prior",10000),rep("Posterior",length(LAI.posterior.dis)))),
+                                  LAI=c(LAI.prior.dis,LAI.posterior.dis))
+ggplot(LAI.prior.dataframe, aes(x=LAI, fill=Type)) + geom_density(alpha=.3)
+
+```
+
+#ggplot ridges plot
+```{r}
+library(ggplot2)
+library(ggridges)
+theme_set(theme_minimal())
+#setting parameter ranges using LAI, N, Cab, Cm, Cw, Car, Cbrown, psoil, sd parameters.
+
+#test
+index <- 8
+variable <- "psoil"
+prior.min <- 0
+prior.max <- 0.5
+LAI.prior.dis <- runif(100089,prior.min,prior.max)
+LAI.group.prior <- rep("Prior",100089)
+LAI.posterior.dis.1 <- MCMC.list[[1]]$Real.dat[,index]
+LAI.group.1 <- rep("04-03",100089)
+LAI.posterior.dis.10 <- MCMC.list[[10]]$Real.dat[,index]
+LAI.group.10 <- rep("05-18",100089)
+LAI.posterior.dis.22 <- MCMC.list[[22]]$Real.dat[,index]
+LAI.group.22 <- rep("06-23",100089)
+LAI.posterior.dis.30 <- MCMC.list[[30]]$Real.dat[,index]
+LAI.group.30 <- rep("07-06",100089)
+LAI.posterior.dis.42 <- MCMC.list[[42]]$Real.dat[,index]
+LAI.group.42 <- rep("08-19",100089)
+LAI.posterior.dis.51 <- MCMC.list[[51]]$Real.dat[,index]
+LAI.group.51 <- rep("09-20",100089)
+LAI.posterior.dis.61 <- MCMC.list[[61]]$Real.dat[,index]
+LAI.group.61 <- rep("10-15",100089)
+LAI.posterior.dis.71 <- MCMC.list[[71]]$Real.dat[,index]
+LAI.group.71 <- rep("11-15",100089)
+
+LAI.ridges <- data.frame(matrix(NA,9*length(LAI.posterior.dis.1),2))
+colnames(LAI.ridges) <- c(variable,"Date")
+LAI.full <- cbind(LAI.posterior.dis.1, LAI.posterior.dis.10, LAI.posterior.dis.22, LAI.posterior.dis.30, LAI.posterior.dis.42,
+                        LAI.posterior.dis.51, LAI.posterior.dis.61, LAI.posterior.dis.71, LAI.prior.dis)
+LAI.label.full <- cbind(LAI.group.1, LAI.group.10, LAI.group.22, LAI.group.30, LAI.group.42, LAI.group.51, LAI.group.61, LAI.group.71, LAI.group.prior)
+LAI.re <- matrix(LAI.full,dim(LAI.ridges)[1],1,byrow = T)
+LAI.label.re <- matrix(LAI.label.full,dim(LAI.ridges)[1],1,byrow = T)
+LAI.ridges$psoil <- LAI.re
+LAI.ridges$Date <- LAI.label.re
+
+#ggplot
+ggplot(LAI.ridges, aes(x = psoil, y = Date, group = Date, fill = stat(x))) + 
+  geom_density_ridges_gradient(scale = 2, size = 0.1, rel_min_height = 0) +
+  scale_fill_viridis_c(name = variable, option = "D") #+
+  #labs(title = 'LAI Changes Across the Year') 
+```
+
+#test
+```{r}
+sensor.num <- rep(0,3)#Landsat, MODIS and Sentinel
+for (i in 1:77) {
+  if(MCMC.list[[i]]$sensor=="landsat8")sensor.num[1] <- sensor.num[1]+1
+  if(MCMC.list[[i]]$sensor=="modis")sensor.num[2] <- sensor.num[2]+1
+  if(MCMC.list[[i]]$sensor=="sentinel.2A")sensor.num[3] <- sensor.num[3]+1
+}
+MODIS.sim.ref <- matrix(NA,7,71)
+MODIS.obs.ref <- MODIS.sim.ref
+LANDSAT.sim.ref <- matrix(NA,7,3)
+LANDSAT.obs.ref <- LANDSAT.sim.ref
+SENTINEL.sim.ref <- matrix(NA,7,3)
+SENTINEL.obs.ref <- SENTINEL.sim.ref
+k1 <- 1
+k2 <- 1
+k3 <- 1
+for (i in 1:77) {
+  if(MCMC.list[[i]]$sensor=="modis"){
+    MODIS.sim.ref[,k1] <- MCMC.list[[i]]$sim.ref
+    MODIS.obs.ref[,k1] <- MCMC.list[[i]]$obs.ref
+    k1 <- k1+1
+  }
+  if(MCMC.list[[i]]$sensor=="landsat8"){
+    LANDSAT.sim.ref[,k2] <- MCMC.list[[i]]$sim.ref
+    LANDSAT.obs.ref[,k2] <- MCMC.list[[i]]$obs.ref
+    k2 <- k2+1
+  }
+  if(MCMC.list[[i]]$sensor=="sentinel.2A"){
+    SENTINEL.sim.ref[,k3] <- MCMC.list[[i]]$sim.ref
+    SENTINEL.obs.ref[,k3] <- MCMC.list[[i]]$obs.ref
+    k3 <- k3+1
+  }
+}
+
+#calculate RMSE
+MODIS.rmse <- matrix(NA,1,7)
+Landsat.rmse <- matrix(NA,1,7)
+Sentinel.rmse <- matrix(NA,1,7)
+for (i in 1:7) {
+  MODIS.rmse[i] <- RMSE(MODIS.sim.ref[i,],MODIS.obs.ref[i,])
+  Landsat.rmse[i] <- RMSE(LANDSAT.sim.ref[i,],LANDSAT.obs.ref[i,])
+  Sentinel.rmse[i] <- RMSE(SENTINEL.sim.ref[i,],SENTINEL.obs.ref[i,])
+  
+}
+Final.Ref.rmse <- rbind(MODIS.rmse,Landsat.rmse,Sentinel.rmse)
+colnames(Final.Ref.rmse) <- c("B1","B2","B3","B4","B5","B6","B7")
+rownames(Final.Ref.rmse) <- c("MODIS","Landsat","Sentinel")
+write.csv(Final.Ref.rmse,file="Ref_RMSE.csv")
+```
+
+#correlation deleted
+```{r}
+#Claim all correlation ts datasets
+All.corr.ts <- list()
+for (i in 1:8) {
+  for (j in i:8) {
+    temp.ts <- rep(NA,length(Corr.list))
+    for (k in 1:length(Corr.list)) {
+      temp.ts[k] <- Corr.list[[i]]$correlation[i,j]
+    }
+    param <- rep(NA,L1)
+    for (k in 1:L) {
+      param[real.time[k]] <- temp.ts[k]
+    }
+    out <- State.space(x=param, time=time, n.iter=10000)
+    All.corr.ts[[(i-1)*8+j]] <- list(ts=out, param=param)
+  }
+}
+
+#plot
+comp1 <- which(var.name=="LAI")
+comp2 <- which(var.name=="Cab")
+index <- (comp1-1)*8+comp2
+out <- All.corr.ts[[index]]$ts
+param <- All.corr.ts[[index]]$param
+plot(time,param,ylim=c(-1,1))
+lines(time,out[3,],col=2)
+lines(time,out[2,],col=3)
+lines(time,out[1,],col=2)
+abline(h=0,col=2,lwd=2)
+
+#figures
+Posterior <- MCMC.list.remv[[10]]$Real.dat
+Thined.posterior <- Thin(Posterior, By=100)[,1:8]
+colnames(Thined.posterior) <- var.name
+CorHeatMap(Thined.posterior)
+
+Posterior <- MCMC.list.remv[[20]]$Real.dat
+Thined.posterior <- Thin(Posterior, By=100)[,1:8]
+colnames(Thined.posterior) <- var.name
+CorHeatMap(Thined.posterior)
+
+Posterior <- MCMC.list.remv[[30]]$Real.dat
+Thined.posterior <- Thin(Posterior, By=100)[,1:8]
+colnames(Thined.posterior) <- var.name
+CorHeatMap(Thined.posterior)
+
+Posterior <- MCMC.list.remv[[40]]$Real.dat
+Thined.posterior <- Thin(Posterior, By=100)[,1:8]
+colnames(Thined.posterior) <- var.name
+CorHeatMap(Thined.posterior)
+
+Posterior <- MCMC.list.remv[[50]]$Real.dat
+Thined.posterior <- Thin(Posterior, By=100)[,1:8]
+colnames(Thined.posterior) <- var.name
+CorHeatMap(Thined.posterior)
+
+Posterior <- MCMC.list.remv[[60]]$Real.dat
+Thined.posterior <- Thin(Posterior, By=100)[,1:8]
+colnames(Thined.posterior) <- var.name
+CorHeatMap(Thined.posterior)
+
+Posterior <- MCMC.list.remv[[70]]$Real.dat
+Thined.posterior <- Thin(Posterior, By=100)[,1:8]
+colnames(Thined.posterior) <- var.name
+CorHeatMap(Thined.posterior)
+
+Posterior <- MCMC.list.remv[[77]]$Real.dat
+Thined.posterior <- Thin(Posterior, By=100)[,1:8]
+colnames(Thined.posterior) <- var.name
+CorHeatMap(Thined.posterior)
+```
+
+
+
+
+

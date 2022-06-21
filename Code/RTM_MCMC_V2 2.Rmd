@@ -1,0 +1,855 @@
+---
+title: "RTM_MCMC_V2"
+author: "Dongchen Zhang"
+date: "7/17/2020"
+output: html_document
+---
+
+#Function
+```{r}
+library(hsdar)
+library(BayesianTools)
+library(rjags)
+library(coda)
+library(TDPanalysis)
+##spectral response
+setwd("/Users/dongchenzhang/Desktop/Learning/Michael/Code")
+load("sensor.RData")
+spec.res <- function(model,sensor){
+  spec <- spectra(model)
+  rsr <- sensor.rsr[[sensor]]
+  for (i in 2:dim(rsr)[2]) {
+    rsr[,i] <- rsr[,i]/sum(rsr[,i])
+  }
+  m <- spec[rsr[,"index"]] * rsr[,-1]
+  out <- apply(m, 2, sum)
+}
+#MCMC function
+RTM_MCMC <- function(sensor, iteration, sza, vza, observed){
+  #setting parameter ranges using LAI, N, Cab, Cm, Cw, Car, Cbrown, psoil, sd parameters.
+  par_min <- c(0, 1,  5,   0,   0,  5, 0,   0,    0)
+  par_max <- c(7, 5, 60, 0.05, 0.05, 7, 4, 0.5,  0.1)
+  #Likelihood function
+  likelihood <- function(param){
+  model <- PROSAIL(LAI = param[1], N = param[2],
+                   Cab = param[3], Cm = param[4],
+                   Cw = param[5], Car = param[6],
+                   Cbrown = param[7], psoil = param[8],
+                   tts = sza, tto = vza)
+  predicted <- spec.res(model,sensor)
+  delta <- observed-predicted
+  #delta[1] <- delta[1]*2
+  ll <- sum(dnorm(delta, mean = 0, sd = param[9], log = T))
+  return(ll)}
+  
+  #Prior density
+  density <- function(par){
+  return(dunif(par[1], par_min[1], par_max[1], log =T)+ #LAI
+         dunif(par[2], par_min[2], par_max[2], log =T)+ #N
+         dunif(par[3], par_min[3], par_max[3], log =T)+ #Cab
+         dunif(par[4], par_min[4], par_max[4], log =T)+ #Cm
+         dunif(par[5], par_min[5], par_max[5], log =T)+ #Cw
+         dunif(par[6], par_min[6], par_max[6], log =T)+ #Car
+         dunif(par[7], par_min[7], par_max[7], log =T)+ #Cbrown
+         dunif(par[8], par_min[8], par_max[8], log =T)+ #psoil
+         dgamma(par[9], 0.1, 0.1, log =T))}             #sd
+  
+  #Prior sampler
+  sampler <- function(n=1){
+  return(cbind(runif(n, par_min[1], par_max[1]), #LAI
+               runif(n, par_min[2], par_max[2]), #N
+               runif(n, par_min[3], par_max[3]), #Cab
+               runif(n, par_min[4], par_max[4]), #Cm
+               runif(n, par_min[5], par_max[5]), #Cw
+               runif(n, par_min[6], par_max[6]), #Car
+               runif(n, par_min[7], par_max[7]), #Cbrown
+               runif(n, par_min[8], par_max[8]), #psoil
+               rgamma(n, 0.1, 0.1)))}            #sd
+  
+  #create prior by build in function
+  prior <- createPrior(density = density, sampler = sampler)
+  #create setup
+  setup <- createBayesianSetup(likelihood, prior = prior, lower = par_min, upper = par_max)
+  settings <- list(iterations = iteration)
+  out <- runMCMC(setup, sampler = "DEzs", settings = settings)#""DREAMzs 
+  #out <- runMCMC(bayesianSetup = setup, sampler = "Metropolis", settings = settings)
+  #output
+  return(out)
+}
+#get simulated reflectance
+sim_ref <- function(MCMC, sensor, sza, vza, observed){
+  param.50 <- getParam(MCMC)[[1]]
+  ref <- spec.res(PROSAIL(LAI = param.50[1], N = param.50[2],
+                   Cab = param.50[3], Cm = param.50[4],
+                   Cw = param.50[5], Car = param.50[6],
+                   Cbrown = param.50[7], psoil = param.50[8],
+                   tts = sza, tto = vza), sensor)
+  #plot(ref,type="l")
+  #lines(observed,col=2)
+  return(ref)
+}
+#get confidential breaks of param
+getParam <- function(MCMC){
+  data <- MCMC$Z
+  param.50 <- rep(0,9)
+  param.2.5 <- rep(0,9)
+  param.97.5 <- rep(0,9)
+  param.var <- rep(0,9)
+  for (i in 1:9) {
+    param.50[i] <- quantile(data[,i],0.5)
+    param.2.5[i] <- quantile(data[,i],0.025)
+    param.97.5[i] <- quantile(data[,i],0.975)
+    param.var[i] <- var(data[,i])
+  }
+  return(list(param.50 = param.50, param.2.5 = param.2.5, param.97.5 = param.97.5, param.var = param.var))
+}
+#Random walk model with obs.err
+State.space1 <- function(x, time, label, sensor.name, obs.err){ #, obs.err ????
+  #specify model
+  model <- "
+  model{
+    #define prior
+    #tau ~ dgamma(0.1,0.1)
+    #r ~ dnorm(0.3,0.01)
+    sigma ~ dgamma(0.1,0.1)
+    x[1] ~ dnorm(0.7,0.01)
+    ### Process model for exponential growth
+    for(t in 2:N) {
+      mu[t] <- x[t-1]
+      x[t] ~ dnorm(mu[t],sigma)
+    }
+    for(t in 1:N){
+      y[t] ~ dnorm(x[t],tau[t])
+    }
+  }
+  "
+  data <- list(y=x, N=length(x), tau=obs.err)
+  L <- length(x)
+  ## initial conditions
+  nchain = 3
+  inits <- list()
+  for(i in 1:nchain){
+    inits[[i]] <- list(sigma=rgamma(1,0.1,0.1))
+  }
+  j.model   <- jags.model (file = textConnection(model),
+                              data = data,
+                              inits = inits,
+                              n.chains = 3)
+  jags.out   <- coda.samples (model = j.model,
+                              variable.names = c("x"),
+                              n.iter = 100000)
+  out <- as.matrix(jags.out)
+  out1 <- matrix(0,3,length(x))
+  for (i in 1:L) {
+    out1[,i] <- quantile(out[,i],c(0.025,0.5,0.975))
+  }
+  return(out1)
+}
+
+#Random walk model
+State.space <- function(x, time, label, sensor.name){ #, obs.err ????
+  #specify model
+  model <- "
+  model{
+    #define prior
+    tau ~ dgamma(0.1,0.1)
+    #r ~ dnorm(0.3,0.01)
+    sigma ~ dgamma(0.1,0.1)
+    x[1] ~ dnorm(0.7,0.01)
+    ### Process model for exponential growth
+    for(t in 2:N) {
+      mu[t] <- x[t-1]
+      x[t] ~ dnorm(mu[t],sigma)
+    }
+    for(t in 1:N){
+      y[t] ~ dnorm(x[t],tau)
+    }
+  }
+  "
+  data <- list(y=x, N=length(x))
+  L <- length(x)
+  ## initial conditions
+  nchain = 3
+  inits <- list()
+  for(i in 1:nchain){
+    inits[[i]] <- list(tau=rgamma(1,0.1,0.1), sigma=rgamma(1,0.1,0.1))
+  }
+  j.model   <- jags.model (file = textConnection(model),
+                              data = data,
+                              inits = inits,
+                              n.chains = 3)
+  jags.out   <- coda.samples (model = j.model,
+                              variable.names = c("x"),
+                              n.iter = 100000)
+  out <- as.matrix(jags.out)
+  out1 <- matrix(0,3,length(x))
+  for (i in 1:L) {
+    out1[,i] <- quantile(out[,i],c(0.025,0.5,0.975))
+  }
+  return(out1)
+}
+#import data by folder name
+Read.csv.RS <- function(Folder.name, Bands.name, Sensor.type){
+  current.path <- getwd()
+  folder.name <- list.files(pattern = Folder.name)
+  setwd(folder.name)
+  Date <- list.files(pattern="*.csv")
+  Data.list <- list()
+  for (i in 1:length(Date)) {
+    Data <- read.csv(Date[i])#Read file
+    Data.list[[i]] <- list(Date = strsplit(Date[i],".csv")[[1]], 
+                           Reflectance = as.matrix(Data[,Bands.name]), Sensor = Sensor.type)
+  }
+  setwd(current.path)
+  return(Data.list)
+}
+#sort date
+Sort.name.by.date <- function(string){
+  Date <- as.Date(string)
+  sorted.Date <- sort(Date)
+  uniq <- unique(sorted.Date)
+  L1 <- length(uniq)
+  Index <- rep(-1,length(string))
+  k <- 1
+  for (i in 1:L1) {
+    position <- which(Date == uniq[i])
+    for (j in 1:length(position)) {
+      Index[k] <- position[j]
+      k <- k + 1
+    }
+  }
+  return(Index)
+}
+#sort data by date
+Sort.data.by.date <- function(data.list){
+  L <- length(data.list)
+  data.name <- rep(0,L)
+  for (i in 1:L) {
+    data.name[i] <- data.list[[i]]$Date
+  }
+  Index <- Sort.name.by.date(data.name)
+  new.data.list <- list()
+  for (i in 1:L) {
+    new.data.list[[i]] <- data.list[[Index[i]]]
+  }
+  return(new.data.list)
+}
+
+Combine.Diff.Data.Sorces <- function(Data.list){
+  All.Data.list <- list()
+  L1 <- length(Data.list)
+  count <- 1
+  for (i in 1:L1) {
+    L2 <- length(Data.list[[i]])
+    for (j in 1:L2) {
+      All.Data.list[[count]] <- Data.list[[i]][[j]]
+      count <- count + 1
+    }
+  }
+  new.Data.list <- Sort.data.by.date(All.Data.list)
+  return(new.Data.list)
+}
+#Main function
+#Main function
+Main.Fun <- function(All.Data.list, iteration, PointID, DateID, Cloud.Status){
+  L1 <- length(DateID)
+  L2 <- length(PointID)
+  out <- list()
+  for (i in 1:L1) {
+    Data.list <- All.Data.list[[DateID[i]]]
+    print(paste("i =",i))
+    print(Data.list$file.name)
+    print(Data.list$Sensor)
+    out1 <- list()
+    for (j in 1:L2) {
+      print(paste("Point.ID =",PointID[j]))
+      #cloud detection
+      if(Cloud.Status[[DateID[i]]]$cloud.type[PointID[j]]!="clear"){
+        next
+      }
+      
+      if(Data.list$Sensor == "modis"){
+        #imput parameters
+        Reflectance <- Data.list$Reflectance[PointID[j],3:9]/10000
+        sza <- Data.list$Reflectance[PointID[j],2]/100
+        vza <- Data.list$Reflectance[PointID[j],1]/100
+        sensor <- "modis"
+        #Run MCMC
+        #MCMC <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = vza, sza = sza, observed = Reflectance)
+        flag <- is.na(try(MCMC <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = vza, sza = sza, observed = Reflectance)))
+        while (flag[1]) {
+          flag <- is.na(try(MCMC <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = vza, sza = sza, observed = Reflectance)))
+          print("error")
+        }
+        #output contains: parameters' estimation, sensor type, simulated ref, observed ref
+        out1[[j]] <- list(Param.est = getParam(MCMC),
+                        sensor = sensor,
+                        sim.ref = sim_ref(MCMC, sensor, sza, vza, Reflectance),
+                        obs.ref = Reflectance,
+                        Date = Data.list$file.name,
+                        Real.dat = MCMC$Z)
+      }
+      if(Data.list$Sensor != "modis"){
+        Reflectance <- Data.list$Reflectance[PointID[j],]/10000
+        sensor <- Data.list$Sensor
+        sza <- Data.list$solar.zenith
+        vza <- Data.list$sensor.zenith
+        #MCMC <- RTM_MCMC(sensor = sensor, iteration = iteration, sza = sza, vza = vza, Reflectance)
+        flag <- is.na(try(MCMC <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = vza, sza = sza, observed = Reflectance)))
+        while (flag[1]) {
+          flag <- is.na(try(MCMC <- RTM_MCMC(sensor = sensor, iteration = iteration, vza = vza, sza = sza, observed = Reflectance)))
+          print("error")
+        }
+        #output contains: parameters' estimation, sensor type, simulated ref, observed ref
+        out1[[j]] <- list(Param.est = getParam(MCMC),
+                        sensor = Data.list$Sensor,
+                        sim.ref = sim_ref(MCMC, sensor, sza, vza, Reflectance),
+                        obs.ref = Reflectance,
+                        Date = Data.list$file.name,
+                        Real.dat = MCMC$Z)
+      }
+    }
+    out[[i]] <- list(Data = out1)
+    
+  }
+  
+  return(out)
+}
+Create.time.points <- function(data.list){
+  L <- length(data.list)
+  DOY <- rep(NA,L)
+  for (i in 1:L) {
+    temp <- data.list[[i]]$Date
+    temp <- gsub("-","/",temp)
+    DOY[i] <- date.to.DOY(temp,format = "yyyy/mm/dd")
+  }
+  start.DOY <- floor(DOY[1]/10)*10
+  end.DOY <- ceiling(DOY[L]/10)*10
+  time.span <- end.DOY - start.DOY + 1
+  time.points <- rep(NA, time.span)
+  DOY <- DOY-start.DOY
+  time.points[DOY] <- 1
+  out <- list(time.points = time.points, start.DOY = start.DOY, end.DOY = end.DOY)
+  return(out)
+}
+main.random.walk <- function(MCMC.list, param.name, time.points){
+  ref.param.name <- c("LAI", "N", "Cab", "Cm", "Cw", "Car", "Cbrown", "psoil", "sd")
+  index <- which(ref.param.name==param.name)
+  L <- length(MCMC.list)
+  L1 <- length(time.points$time.points)
+  real.time <- which(time.points$time.points==1)
+  time <- time.points$start.DOY:time.points$end.DOY
+  param.var <- rep(NA,L1)
+  sensor.name <- rep(NA,L1)
+  param <- rep(NA,L1)
+  for (i in 1:L) {
+    param[real.time[i]] <- MCMC.list[[i]]$Param.est[[1]][index]
+    sensor.name[real.time[i]] <- MCMC.list[[i]]$sensor
+    param.var[real.time[i]] <- 1/MCMC.list[[i]]$Param.est[[4]][index]
+  }
+  if(is.na(param.var[1]))param.var[1] <- param.var[which(!is.na(param.var))[1]]
+  for (i in 2:L1) {
+    if(is.na(param.var[i])){
+      param.var[i] <- param.var[i-1]
+      next
+    }
+  }
+  # param.var[which(is.na(param.var))] <- (max(param.var[which(!is.na(param.var))])+
+  #                                           min(param.var[which(!is.na(param.var))]))/2
+  #handling start and end
+  # if(is.na(param[1])){
+  #   param[1] <- param[which(!is.na(param))[1]]
+  # }
+  # if(is.na(param[L1])){
+  #   param[L1] <- param[which(!is.na(param))[length(which(!is.na(param)))]]
+  # }
+  #preprocess data
+  if(max(param,na.rm = T)<=1 && max(param,na.rm = T)>0.1){
+    param <- param*10
+    param.var <- param.var/100
+    param.name <- paste(sep = "",param.name,"*10^(-1)")
+  }
+  if(max(param,na.rm = T)<=0.1){
+    param <- param*100
+    param.var <- param.var/10000
+    param.name <- paste(sep = "",param.name,"*10^(-2)")
+  }
+  out <- State.space1(x=param, time=time, label=param.name, obs.err=param.var)#, obs.err=sd ???
+  #handle different sensor
+  uni.sensor <- na.omit(unique(sensor.name))
+  L2 <- length(uni.sensor)
+  param2 <- list()
+  time2 <- list()
+  for (i in 1:L2) {
+    param2[[i]] <- param[which(sensor.name==uni.sensor[i])]
+    time2[[i]] <- time[which(sensor.name==uni.sensor[i])]
+  }
+  test <- param[which(sensor.name==uni.sensor[2])]
+  y.min <- min(out)
+  y.max <- max(out)
+  #plot
+  plot(time2[[1]],param2[[1]],ylab=param.name,xlab="DOY",ylim=c(y.min,y.max),col=1,pch=19)
+  points(time2[[2]],param2[[2]],col=2,pch=19)
+  points(time2[[3]],param2[[3]],col=3,pch=19)
+  lines(time,out[1,],col="red",lty=2)
+  lines(time,out[2,],col="black")
+  lines(time,out[3,],col="red",lty=2)
+  legend(x=min(time),y=y.max,col=c(1,2,3),pch=rep(19,3),legend = c(uni.sensor[1],uni.sensor[2],uni.sensor[3]),cex = 0.8)
+  return(out)
+}
+remove.same.date <- function(data.list){
+  L <- length(data.list)
+  date.var <- rep("",L)
+  for (i in 1:L) {
+    date.var[i] <- as.Date(data.list[[i]]$Date)
+  }
+  uniq <- unique(date.var)
+  L1 <- length(uniq)
+  pos <- rep(0,L1)
+  for (i in 1:L1) {
+    pos1 <- which(date.var==uniq[i])
+    if(length(pos1)>1){
+      pos[i] <- pos1[1]
+    }else{
+      pos[i] <- pos1
+    }
+  }
+  new.data.list <- data.list[pos]
+}
+box.plot <- function(MCMC.list, param.name, time.points){
+  ref.param.name <- c("LAI", "N", "Cab", "Cm", "Cw", "Car", "Cbrown", "psoil", "sd")
+  index <- which(ref.param.name==param.name)
+  real.DOY <- time.points$start.DOY + which(time.points$time.points==1) - 1
+  L1 <- length(MCMC.list)
+  L2 <- dim(MCMC.list[[1]]$Real.dat)[1]
+  param <- matrix(NA,L1*L2,2)
+  for (i in 1:L1) {
+    dat <- MCMC.list[[i]]$Real.dat[,index]
+    start <- (i-1)*L2+1
+    end <- i*L2
+    param[start:end,1] <- real.DOY[i]
+    param[start:end,2] <- dat
+  }
+  colnames(param) <- c("DOY","Param")
+  boxplot(Param~DOY,param,outline=F,ylab=param.name,xlab="DOY")
+  return(param)
+}
+```
+
+
+#Import data
+```{r}
+#import Landsat data
+current.path <- getwd()
+setwd("original_data")
+folder.name <- "509_Landsat"
+Bands.name <- c("B1", "B2", "B3", "B4", "B5", "B6", "B7")
+Sensor <- "landsat8"
+Landsat.Data <- Read.csv.RS(Folder.name = folder.name, Bands.name = Bands.name, Sensor.type = Sensor)
+Landsat.Data <- Sort.data.by.date(Landsat.Data)
+#add geometry info
+Landsat.Solar.zenith <- c(35.660221, 25.123032, 45.126869)
+Landsat.Sensor.zenith <- rep(0,3)
+for (i in 1:3) {
+  Landsat.Data[[i]]$solar.zenith <- Landsat.Solar.zenith[i]
+  Landsat.Data[[i]]$sensor.zenith <- Landsat.Sensor.zenith[i]
+}
+#import modis data
+folder.name <- "new_MODIS"
+Bands.name <- c("SensorZenith", "SolarZenith", "sur_refl_b01", "sur_refl_b02", "sur_refl_b03", "sur_refl_b04", "sur_refl_b05", "sur_refl_b06", "sur_refl_b07")
+Sensor <- "modis"
+MODIS.Data <- Read.csv.RS(Folder.name = folder.name, Bands.name = Bands.name, Sensor.type = Sensor)
+MODIS.Data <- Sort.data.by.date(MODIS.Data)
+
+#import sentinel data
+folder.name <- "509_Sentinel"
+Bands.name <- c("B1", "B2", "B3", "B4", "B8", "B11", "B12")
+Sensor <- "sentinel.2A"
+Sentinel.Data <- Read.csv.RS(Folder.name = folder.name, Bands.name = Bands.name, Sensor.type = Sensor)
+Sentinel.Data <- Sort.data.by.date(Sentinel.Data)
+#add geometry info
+L <- length(Sentinel.Data)
+Sentinel.Solar.zenith <- c(39.7021, 25.7354, 23.0757, 22.8360, 22.7420, 22.8200, 23.8985, 27.0888, 28.1616, 29.3216, 34.8410, 43.2402, 45.0389, 46.8528, 48.6731, 52.2720, 58.9460, 60.4192, 65.1276)
+Sentinel.Sensor.zenith <- rep(3.5,L)
+for (i in 1:L) {
+  Sentinel.Data[[i]]$solar.zenith <- Sentinel.Solar.zenith[i]
+  Sentinel.Data[[i]]$sensor.zenith <- Sentinel.Sensor.zenith[i]
+}
+
+#Combine different data sources
+All.data.list <- list(Landsat.Data, MODIS.Data, Sentinel.Data)
+All.data.list <- Combine.Diff.Data.Sorces(All.data.list)
+#All.data.list <- remove.same.date(All.data.list)
+#Remove data
+rm(MODIS.Data,Sentinel.Data,Landsat.Data)
+```
+
+#Main part
+```{r}
+#RUN MCMC
+MCMC.list <- list()
+iteration <- 100000
+MCMC.list[1:10] <- Main.Fun(All.data.list[1:10], iteration, 20)
+MCMC.list[11:20] <- Main.Fun(All.data.list[11:20], iteration, 20)
+MCMC.list[21:30] <- Main.Fun(All.data.list[21:30], iteration, 20)
+MCMC.list[31:40] <- Main.Fun(All.data.list[31:40], iteration, 20)
+MCMC.list[41:50] <- Main.Fun(All.data.list[41:50], iteration, 20)
+MCMC.list[51:60] <- Main.Fun(All.data.list[51:60], iteration, 20)
+MCMC.list[61:70] <- Main.Fun(All.data.list[61:70], iteration, 20)
+MCMC.list[71:80] <- Main.Fun(All.data.list[71:80], iteration, 20)
+save(MCMC.list,file="real.MCMC.RData")
+# save(MCMC.list,file="new.MCMC.RData")
+# load("MCMC.list.RData")
+# #RUN Random model
+# time.points <- Create.time.points(All.data.list)
+# LAI.Random.walk <-  main.random.walk(MCMC.list,"LAI",time.points)
+# Cab.Random.walk <-  main.random.walk(MCMC.list,"Cab",time.points)
+# Cm.Random.walk <-  main.random.walk(MCMC.list,"Cm",time.points)
+# Cw.Random.walk <-  main.random.walk(MCMC.list,"Cw",time.points)
+```
+
+```{r}
+#New dataset
+load("real.MCMC.RData")
+#RUN Random model
+time.points <- Create.time.points(All.data.list)
+LAI.Random.walk <-  main.random.walk(MCMC.list,"LAI",time.points)
+Cab.Random.walk <-  main.random.walk(MCMC.list,"Cab",time.points)
+Cm.Random.walk <-  main.random.walk(MCMC.list,"Cm",time.points)
+Cw.Random.walk <-  main.random.walk(MCMC.list,"Cw",time.points)
+Car.Random.walk <-  main.random.walk(MCMC.list,"Car",time.points)
+Cbrown.Random.walk <-  main.random.walk(MCMC.list,"Cbrown",time.points)
+#boxplot
+boxplot.LAI <- box.plot(MCMC.list,"LAI",time.points)
+boxplot.Cab <- box.plot(MCMC.list,"Cab",time.points)
+boxplot.Cm <- box.plot(MCMC.list,"Cm",time.points)
+boxplot.Cw <- box.plot(MCMC.list,"Cw",time.points)
+boxplot.Car <- box.plot(MCMC.list,"Car",time.points)
+boxplot.Cbrown <- box.plot(MCMC.list,"Cbrown",time.points)
+```
+
+#test point 20
+```{r}
+# for (i in 1:length(All.data.list)) {
+#   Dat <- Main.Fun(All.data.list,100, 1:40, i, cloud.status)
+#   Date <- paste("/Users/dongchenzhang/Desktop/Learning/Michael/Code/Reulst_Data/","Result", as.character(i),".RData",sep = "")
+#   print(Date)
+#   save(Dat, file = Date)
+#   rm(Dat)
+# }
+Dat.20 <- Main.Fun(All.data.list,100000, 20, 1:95, cloud.status)
+save(Dat.20,file="/Users/dongchenzhang/Desktop/Learning/Michael/Code/Reulst_Data/Point20_2.RData")
+# Dat.20.test <- Main.Fun(All.data.list,100000, 20, 50, cloud.status)
+# plot(density(Dat.20.test[[1]]$Data[[1]]$Real.dat[,4]))
+#Create new data.list
+load("/Users/dongchenzhang/Desktop/Learning/Michael/Code/Reulst_Data/Point20_2.RData")
+MCMC.list <- list()
+for (i in 1:length(Dat.20)) {
+  if(length(Dat.20[[i]]$Data)!=0){
+    MCMC.list[[i]] <- Dat.20[[i]]$Data[[1]]
+    MCMC.list[[i]]$Date <- All.data.list[[i]]$file.name
+  }
+}
+#remove NULL in a list
+MCMC.list <- MCMC.list[-(which(sapply(MCMC.list,is.null),arr.ind=TRUE))]
+
+#check on reflectance
+plot(MCMC.list[[1]]$sim.ref,MCMC.list[[1]]$obs.ref,xlim=c(0,0.5),ylim=c(0,0.5))
+for (i in 1:length(MCMC.list)) {
+  points(MCMC.list[[i]]$sim.ref,MCMC.list[[i]]$obs.ref)
+}
+lines(seq(0,1,length=100),seq(0,1,length=100),lwd=1.5,col=2)
+
+#Remove same date(1, 7, )
+MCMC.list <- remove.same.date(MCMC.list)
+
+#Create time point
+time.points <- Create.time.points(MCMC.list)
+
+#Random walk model
+N.Random.walk <- main.random.walk(MCMC.list,"N",time.points)
+LAI.Random.walk <-  main.random.walk(MCMC.list,"LAI",time.points)
+Cab.Random.walk <-  main.random.walk(MCMC.list,"Cab",time.points)
+Cm.Random.walk <-  main.random.walk(MCMC.list,"Cm",time.points)
+Cw.Random.walk <-  main.random.walk(MCMC.list,"Cw",time.points)
+#Car.Random.walk <-  main.random.walk(MCMC.list,"Car",time.points)
+Cbrown.Random.walk <-  main.random.walk(MCMC.list,"Cbrown",time.points)
+#psoil.Random.walk <- main.random.walk(MCMC.list,"psoil",time.points)
+
+
+
+#boxplot
+boxplot.N <- box.plot(MCMC.list,"N",time.points)
+boxplot.LAI <- box.plot(MCMC.list,"LAI",time.points)
+boxplot.Cab <- box.plot(MCMC.list,"Cab",time.points)
+boxplot.Cm <- box.plot(MCMC.list,"Cm",time.points)
+boxplot.Cw <- box.plot(MCMC.list,"Cw",time.points)
+boxplot.Car <- box.plot(MCMC.list,"Car",time.points)
+boxplot.Cbrown <- box.plot(MCMC.list,"Cbrown",time.points)
+
+#LAI validation
+LAI.ground <- read.csv("hf069-01-lai-plot.csv")
+LAI.plot <- function(PointID, Year){
+  temp.dat <- LAI.ground[which(LAI.ground$year==Year),]
+  temp.dat1 <- data.frame(matrix(NA,1,6))
+  colnames(temp.dat1) <- colnames(temp.dat)
+  for (i in 1:length(PointID)) {
+    temp.dat1 <- rbind(temp.dat1, temp.dat[which(temp.dat$plot==PointID[i]),])
+  }
+  temp.dat1 <- temp.dat1[-1,]
+  Uni.doy <- unique(temp.dat1$doy)
+  temp.dat2 <- rep(NA,length(Uni.doy))
+  for (i in 1:length(Uni.doy)) {
+    temp.dat2[i] <- mean(temp.dat1[which(temp.dat1$doy==Uni.doy[i]),]$lai)
+  }
+  plot(Uni.doy,temp.dat2,ylim=c(0,6),type="l")
+  rbind(temp.dat2,Uni.doy)
+}
+LAI.Random.walk <-  main.random.walk(MCMC.list,"LAI",time.points)
+
+Year <- 2019
+ID <- unique(LAI.ground[which(LAI.ground$year==Year),]$plot)
+test <- LAI.plot(ID[17],Year)
+plot(90:340, LAI.Random.walk[1,],type="l",col=2, ylim=c(min(LAI.Random.walk),max(LAI.Random.walk)),lty=2)
+lines(90:340, LAI.Random.walk[2,],col=1)
+lines(90:340, LAI.Random.walk[3,],col=2,lty=2)
+points(test[2,],test[1,],col=3)
+```
+
+#point 25 test
+```{r}
+# load("/Users/dongchenzhang/Desktop/Cloud\ Detection/AllData.RData")
+# Dat.25 <- Main.Fun(All.data.list,100000, 25, 1:95, cloud.status)
+# save(Dat.25,file="/Users/dongchenzhang/Desktop/Learning/Michael/Code/Reulst_Data/Point25.RData")
+
+#Create new data.list
+load("/Users/dongchenzhang/Desktop/Learning/Michael/Code/Reulst_Data/Point25.RData")
+load("AllData.RData")
+MCMC.list <- list()
+for (i in 1:length(Dat.25)) {
+  if(length(Dat.25[[i]]$Data)!=0){
+    #print(All.data.list[[i]]$Date)
+    MCMC.list[[i]] <- Dat.25[[i]]$Data[[1]]
+    MCMC.list[[i]]$Date <- All.data.list[[i]]$file.name
+  }
+}
+#remove NULL in a list
+MCMC.list <- MCMC.list[-(which(sapply(MCMC.list,is.null),arr.ind=TRUE))]
+
+#Remove same date(1, 7, )
+MCMC.list <- remove.same.date(MCMC.list)
+
+#Create time point
+time.points <- Create.time.points(MCMC.list)
+
+#Random walk model
+N.Random.walk <- main.random.walk(MCMC.list,"N",time.points)
+LAI.Random.walk <-  main.random.walk(MCMC.list,"LAI",time.points)
+Cab.Random.walk <-  main.random.walk(MCMC.list,"Cab",time.points)
+Cm.Random.walk <-  main.random.walk(MCMC.list,"Cm",time.points)
+Cw.Random.walk <-  main.random.walk(MCMC.list,"Cw",time.points)
+Car.Random.walk <-  main.random.walk(MCMC.list,"Car",time.points)
+Cbrown.Random.walk <-  main.random.walk(MCMC.list,"Cbrown",time.points)
+#boxplot
+boxplot.N <- box.plot(MCMC.list,"N",time.points)
+boxplot.LAI <- box.plot(MCMC.list,"LAI",time.points)
+boxplot.Cab <- box.plot(MCMC.list,"Cab",time.points)
+boxplot.Cm <- box.plot(MCMC.list,"Cm",time.points)
+boxplot.Cw <- box.plot(MCMC.list,"Cw",time.points)
+boxplot.Car <- box.plot(MCMC.list,"Car",time.points)
+boxplot.Cbrown <- box.plot(MCMC.list,"Cbrown",time.points)
+```
+
+#test point 36
+```{r}
+#load("/Users/dongchenzhang/Desktop/Cloud\ Detection/AllData.RData")
+Dat.36 <- Main.Fun(All.data.list,100000, 36, 1:95, cloud.status)
+save(Dat.36,file="/Users/dongchenzhang/Desktop/Learning/Michael/Code/Reulst_Data/Point36_1.RData")
+
+#Create new data.list
+load("/Users/dongchenzhang/Desktop/Learning/Michael/Code/Reulst_Data/Point36_1.RData")
+MCMC.list <- list()
+for (i in 1:length(Dat.36)) {
+  if(length(Dat.36[[i]]$Data)!=0){
+    #print(All.data.list[[i]]$Date)
+    MCMC.list[[i]] <- Dat.36[[i]]$Data[[1]]
+    MCMC.list[[i]]$Date <- All.data.list[[i]]$file.name
+  }
+}
+#remove NULL in a list
+MCMC.list <- MCMC.list[-(which(sapply(MCMC.list,is.null),arr.ind=TRUE))]
+
+#Remove same date(1, 7, )
+MCMC.list <- remove.same.date(MCMC.list)
+
+#Create time point
+time.points <- Create.time.points(MCMC.list)
+
+# #Random walk model
+# N.Random.walk <- main.random.walk(MCMC.list,"N",time.points)
+# LAI.Random.walk <-  main.random.walk(MCMC.list,"LAI",time.points)
+# Cab.Random.walk <-  main.random.walk(MCMC.list,"Cab",time.points)
+# Cm.Random.walk <-  main.random.walk(MCMC.list,"Cm",time.points)
+# Cw.Random.walk <-  main.random.walk(MCMC.list,"Cw",time.points)
+# Car.Random.walk <-  main.random.walk(MCMC.list,"Car",time.points)
+# Cbrown.Random.walk <-  main.random.walk(MCMC.list,"Cbrown",time.points)
+# #boxplot
+# boxplot.N <- box.plot(MCMC.list,"N",time.points)
+# boxplot.LAI <- box.plot(MCMC.list,"LAI",time.points)
+# boxplot.Cab <- box.plot(MCMC.list,"Cab",time.points)
+# boxplot.Cm <- box.plot(MCMC.list,"Cm",time.points)
+# boxplot.Cw <- box.plot(MCMC.list,"Cw",time.points)
+# boxplot.Car <- box.plot(MCMC.list,"Car",time.points)
+# boxplot.Cbrown <- box.plot(MCMC.list,"Cbrown",time.points)
+
+#LAI validation
+LAI.ground <- read.csv("hf069-01-lai-plot.csv")
+ID <- c("E1","E2", "E3", "E4", "E5", 
+        "F1", "F2", "F3", "F4", "F5",
+        "G1", "G2", "G3", "G4", "G5",
+        "H1", "H2", "H3", "H4", "H5")
+ID <- unique(LAI.ground[which(LAI.ground$year==2018),]$plot)
+Year <- 2018
+LAI.Random.walk <-  main.random.walk(MCMC.list,"LAI",time.points)
+test <- LAI.plot(ID,2018)
+plot(90:340, LAI.Random.walk[1,],type="l",col=2, ylim=c(min(LAI.Random.walk),max(LAI.Random.walk)),lty=2, main="Original Prior")
+lines(90:340, LAI.Random.walk[2,],col=1)
+lines(90:340, LAI.Random.walk[3,],col=2,lty=2)
+points(test[2,],test[1,],col=3)
+
+#validatin2
+plot(90:340, LAI.Random.walk1[1,],type="l",col=2, ylim=c(min(LAI.Random.walk),max(LAI.Random.walk)),lty=2, main="New Prior")
+lines(90:340, LAI.Random.walk1[2,],col=1)
+lines(90:340, LAI.Random.walk1[3,],col=2,lty=2)
+points(test[2,],test[1,],col=3)
+```
+
+#test point 1
+```{r}
+# load("/Users/dongchenzhang/Desktop/Cloud\ Detection/AllData.RData")
+# Dat.1 <- Main.Fun(All.data.list,100000, 1, 1:95, cloud.status)
+# save(Dat.1,file="/Users/dongchenzhang/Desktop/Learning/Michael/Code/Reulst_Data/Point1.RData")
+
+#Create new data.list
+load("/Users/dongchenzhang/Desktop/Learning/Michael/Code/Reulst_Data/Point1.RData")
+MCMC.list <- list()
+for (i in 1:length(Dat.1)) {
+  if(length(Dat.1[[i]]$Data)!=0){
+    #print(All.data.list[[i]]$Date)
+    MCMC.list[[i]] <- Dat.1[[i]]$Data[[1]]
+    MCMC.list[[i]]$Date <- All.data.list[[i]]$file.name
+  }
+}
+#remove NULL in a list
+MCMC.list <- MCMC.list[-(which(sapply(MCMC.list,is.null),arr.ind=TRUE))]
+
+#Remove same date(1, 7, )
+MCMC.list <- remove.same.date(MCMC.list)
+
+#Create time point
+time.points <- Create.time.points(MCMC.list)
+
+#Random walk model
+N.Random.walk <- main.random.walk(MCMC.list,"N",time.points)
+LAI.Random.walk <-  main.random.walk(MCMC.list,"LAI",time.points)
+Cab.Random.walk <-  main.random.walk(MCMC.list,"Cab",time.points)
+Cm.Random.walk <-  main.random.walk(MCMC.list,"Cm",time.points)
+Cw.Random.walk <-  main.random.walk(MCMC.list,"Cw",time.points)
+Car.Random.walk <-  main.random.walk(MCMC.list,"Car",time.points)
+Cbrown.Random.walk <-  main.random.walk(MCMC.list,"Cbrown",time.points)
+#boxplot
+boxplot.N <- box.plot(MCMC.list,"N",time.points)
+boxplot.LAI <- box.plot(MCMC.list,"LAI",time.points)
+boxplot.Cab <- box.plot(MCMC.list,"Cab",time.points)
+boxplot.Cm <- box.plot(MCMC.list,"Cm",time.points)
+boxplot.Cw <- box.plot(MCMC.list,"Cw",time.points)
+boxplot.Car <- box.plot(MCMC.list,"Car",time.points)
+boxplot.Cbrown <- box.plot(MCMC.list,"Cbrown",time.points)
+```
+
+
+
+
+
+
+
+
+
+
+#New prior comparison
+```{r}
+load("/Users/dongchenzhang/Desktop/Cloud\ Detection/AllData.RData")
+# Dat.36 <- Main.Fun(All.data.list,100000, 36, 1:95, cloud.status)
+# save(Dat.36,file="/Users/dongchenzhang/Desktop/Learning/Michael/Code/Reulst_Data/Point36_1.RData")
+
+#Create new data.list
+load("/Users/dongchenzhang/Desktop/Learning/Michael/Code/Reulst_Data/Point36.RData")
+MCMC.list <- list()
+for (i in 1:length(Dat.36)) {
+  if(length(Dat.36[[i]]$Data)!=0){
+    #print(All.data.list[[i]]$Date)
+    MCMC.list[[i]] <- Dat.36[[i]]$Data[[1]]
+    MCMC.list[[i]]$Date <- All.data.list[[i]]$file.name
+  }
+}
+#remove NULL in a list
+MCMC.list <- MCMC.list[-(which(sapply(MCMC.list,is.null),arr.ind=TRUE))]
+
+#check on reflectance
+plot(MCMC.list[[1]]$sim.ref,MCMC.list[[1]]$obs.ref,xlim=c(0,0.5),ylim=c(0,0.5))
+for (i in 1:length(MCMC.list)) {
+  points(MCMC.list[[i]]$sim.ref,MCMC.list[[i]]$obs.ref)
+}
+lines(seq(0,1,length=100),seq(0,1,length=100),lwd=1.5,col=2)
+
+#Remove same date(1, 7, )
+MCMC.list <- remove.same.date(MCMC.list)
+
+#Create time point
+time.points <- Create.time.points(MCMC.list)
+
+#Random walk model
+N.Random.walk <- main.random.walk(MCMC.list,"N",time.points)
+LAI.Random.walk <-  main.random.walk(MCMC.list,"LAI",time.points)
+Cab.Random.walk <-  main.random.walk(MCMC.list,"Cab",time.points)
+Cm.Random.walk <-  main.random.walk(MCMC.list,"Cm",time.points)
+Cw.Random.walk <-  main.random.walk(MCMC.list,"Cw",time.points)
+#Car.Random.walk <-  main.random.walk(MCMC.list,"Car",time.points)
+Cbrown.Random.walk <-  main.random.walk(MCMC.list,"Cbrown",time.points)
+
+#Create new data.list
+load("/Users/dongchenzhang/Desktop/Learning/Michael/Code/Reulst_Data/Point36_1.RData")
+MCMC.list <- list()
+for (i in 1:length(Dat.36)) {
+  if(length(Dat.36[[i]]$Data)!=0){
+    #print(All.data.list[[i]]$Date)
+    MCMC.list[[i]] <- Dat.36[[i]]$Data[[1]]
+    MCMC.list[[i]]$Date <- All.data.list[[i]]$file.name
+  }
+}
+#remove NULL in a list
+MCMC.list <- MCMC.list[-(which(sapply(MCMC.list,is.null),arr.ind=TRUE))]
+
+#check on reflectance
+plot(MCMC.list[[1]]$sim.ref,MCMC.list[[1]]$obs.ref,xlim=c(0,0.5),ylim=c(0,0.5))
+for (i in 1:length(MCMC.list)) {
+  points(MCMC.list[[i]]$sim.ref,MCMC.list[[i]]$obs.ref)
+}
+lines(seq(0,1,length=100),seq(0,1,length=100),lwd=1.5,col=2)
+
+#Remove same date(1, 7, )
+MCMC.list <- remove.same.date(MCMC.list)
+
+#Create time point
+time.points <- Create.time.points(MCMC.list)
+
+#Random walk model
+N.Random.walk <- main.random.walk(MCMC.list,"N",time.points)
+LAI.Random.walk <-  main.random.walk(MCMC.list,"LAI",time.points)
+Cab.Random.walk <-  main.random.walk(MCMC.list,"Cab",time.points)
+Cm.Random.walk <-  main.random.walk(MCMC.list,"Cm",time.points)
+Cw.Random.walk <-  main.random.walk(MCMC.list,"Cw",time.points)
+#Car.Random.walk <-  main.random.walk(MCMC.list,"Car",time.points)
+Cbrown.Random.walk <-  main.random.walk(MCMC.list,"Cbrown",time.points)
+```
+

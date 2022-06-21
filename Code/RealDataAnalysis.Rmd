@@ -1,0 +1,420 @@
+---
+title: "RealDataAnalysis"
+output: html_document
+---
+
+#Function
+```{r}
+library(BayesianTools)
+library(hsdar)
+#Convert continuous reflectance into segments corresponding to landsat 7 wavebands(7 wavebands in total)
+getData <- function(model){
+  spec <- spectra(model)
+  w1 <- c(430,450)-400
+  w2 <- c(450,510)-400
+  w3 <- c(530,590)-400
+  w4 <- c(640,670)-400
+  w5 <- c(850,880)-400
+  w6 <- c(1570,1650)-400
+  w7 <- c(2110,2290)-400
+  w8 <- c(500,680)-400
+  ref <- c(mean(spec[w1[1]:w1[2]]),
+           mean(spec[w2[1]:w2[2]]),
+           mean(spec[w3[1]:w3[2]]),
+           mean(spec[w4[1]:w4[2]]),
+           mean(spec[w5[1]:w5[2]]),
+           mean(spec[w6[1]:w6[2]]),
+           mean(spec[w7[1]:w7[2]])
+           )
+  return(ref)
+}
+#mcmc function
+RUN_MCMC2 <- function(iteration, observed, tts){
+  #likelihood function
+  likelihood <- function(param){
+  LAI=param[1]
+  Cab=param[2]
+  Cw=param[3]
+  Cm=param[4]
+  sd=param[5]
+  psoil=param[6]
+  Cbrown=param[7]
+  N=param[8]
+  predicted = getData(PROSAIL(LAI = LAI,Cab = Cab, Car = 15,Cm=Cm,Cw=Cw, tts = tts, tto = 0, lidfa = -0.35, lidfb = -0.15, psoil = psoil, Cbrown = Cbrown, N=N))
+  ll = sum(dnorm(observed, mean = predicted, sd = sd, log = T))
+  return(ll)}
+  
+  #define prior PDF
+  density = function(par){
+  d1 = dunif(par[1],1,7,log = TRUE)
+    #d1 = dnorm(par[1],4.6,1,log = T)
+  d2 = dunif(par[2],0,70,log = TRUE)
+  d3 = dunif(par[3],0,0.03,log=T)
+  d4 = dunif(par[4],0,0.03,log = T)
+  d5 = dgamma(par[5], 0.1,0.1, log =TRUE)
+  d6 = dunif(par[6],0,0.5,log = T)
+  d7 = dunif(par[7],0,4,log = T)
+  d8 = dunif(par[8],1,5,log = T)
+  return(d1 + d2 + d3  + d4 + d5 + d6 + d7 + d8)}
+  #define sampler
+  
+  sampler = function(n=1){
+  d1 = runif(n,1,7)
+    #d1 = rnorm(n,4.6,1)
+  d2 = runif(n,0,70)
+  d3 = runif(n,0,0.03)
+  d4 = runif(n,0,0.03)
+  d5 = rgamma(n,0.1,0.1)
+  d6 = runif(n,0,0.5)
+  d7 = runif(n,0,4)
+  d8 = runif(n,1,5)
+  return(cbind(d1,d2,d3,d4,d5,d6,d7,d8))}
+  
+  #create prior by build in function
+  prior <- createPrior(density=density,sampler = sampler)
+  #create setup
+  setup = createBayesianSetup(likelihood, prior = prior,
+                            lower = c(1,0,0,0,0,0,0,1), upper = c(7,70,0.03,0.03,0.2,0.5,4,5))
+  settings <- list(iterations = iteration)
+  out = runMCMC(setup, sampler = "DEzs", settings = settings)#""DREAMzs 
+  #output
+  return(out)
+}
+sim_ref <- function(mcmc,tts){
+  param <- rep(0,4)
+  for (i in 1:4) {
+    param[i] <- quantile(mcmc$Z[,i],0.5)
+  }
+  ref <- getData(PROSAIL(LAI = param[1],Cab = param[2], Car = 15,Cm=param[4],Cw=param[3], tts = tts, tto = 0, lidfa = -0.35, lidfb = -0.15))
+  return(ref)
+}
+```
+
+#Realize
+```{r}
+ref.ob <- read.csv("509Data/2017-07-16.csv")[,c(2,5,6,7,8,9,10)]
+ref.ob <- ref.ob/10000
+ref.ob <- as.matrix(ref.ob)
+tts <- 27.115921
+#
+out <- list()
+iteration <- 50000
+for (i in 1:1) {
+  observed <- ref.ob[i,]
+  out[[i]] <- RUN_MCMC2(iteration = iteration, observed = observed, tts = tts)
+  print(i)
+}
+plot(out[[1]])
+ref <- sim_ref(out[[1]],tts)
+summary(out[[1]])
+
+
+predicted = getData(PROSAIL(LAI = 5.452,Cab = 46.332, Car = 15,Cw=0.023,Cm=0.005, tts = tts, tto = 0, lidfa = -0.35, lidfb = -0.15, psoil = 0.275, Cbrown = 0.407,N=3.163))
+plot(predicted,type="l",col=1)
+lines(ref.ob[1,],col=2)
+```
+
+#Analyze
+```{r}
+#2017-04-11
+load("RDATA/2017-04-11.RData")
+Table_4_11 <- out
+ref_4_11 <- as.matrix(read.csv("509Data/2017-04-11.csv")[,c(2,5,6,7,8,9,10)]/10000)
+
+test <- Table_4_11[[1]]
+plot(test)
+summary(test)
+gelmanDiagnostics(test,plot = T)
+test <- test
+observe <- ref_4_11[1,]
+tts <- 54.266411
+ref <- sim_ref(test,tts)
+plot(ref,type="l",col="red")
+lines(observe)
+
+#2017-06-14
+load("RDATA/2017-06-14.RData")
+Table_6_14 <- out
+ref_6_14 <- as.matrix(read.csv("509Data/2017-06-14.csv")[,c(2,5,6,7,8,9,10)]/10000)
+
+test <- Table_6_14[[8]]
+plot(test)
+summary(test)
+gelmanDiagnostics(test,plot = T)
+test <- test
+observe <- ref_6_14[8,]
+tts <- 24.717606
+ref <- sim_ref(test,tts)
+plot(ref,type="l",col="red")
+lines(observe)
+
+#2017-07-16
+load("RDATA/2017-07-16.RData")
+Table_7_16 <- out
+ref_7_16 <- as.matrix(read.csv("509Data/2017-07-16.csv")[,c(2,5,6,7,8,9,10)]/10000)
+
+test <- Table_7_16[[1]]
+plot(test)
+summary(test)
+gelmanDiagnostics(test,plot = T)
+test <- test
+observe <- ref_7_16[1,]
+tts <- 27.115921
+ref <- sim_ref(test,tts)
+plot(ref,type="l",col="red")
+lines(observe)
+
+#2017-10-20
+load("RDATA/2017-10-20.RData")
+Table_10_20 <- out
+ref_10_20 <- as.matrix(read.csv("509Data/2017-10-20.csv")[,c(2,5,6,7,8,9,10)]/10000)
+
+test <- Table_10_20[[1]]
+plot(test)
+summary(test)
+gelmanDiagnostics(test,plot = T)
+test <- test
+observe <- ref_10_20[1,]
+tts <- 54.266411
+ref <- sim_ref(test,tts)
+plot(ref,type="l",col="red")
+lines(observe)
+
+#2017-11-21
+load("RDATA/2017-11-21.RData")
+Table_11_21 <- out
+ref_11_21 <- as.matrix(read.csv("509Data/2017-11-21.csv")[,c(2,5,6,7,8,9,10)]/10000)
+
+test <- Table_11_21[[1]]
+plot(test)
+summary(test)
+gelmanDiagnostics(test,plot = T)
+test <- test
+observe <- ref_11_21[1,]
+tts <- 63.551529
+ref <- sim_ref(test,tts)
+plot(ref,type="l",col="red")
+lines(observe)
+#283-624-1571
+```
+
+#Validation-Reflectance
+```{r}
+#2017-04-11
+load("RDATA/2017-04-11.RData")
+Table_4_11 <- out
+ref_4_11 <- as.matrix(read.csv("509Data/2017-04-11.csv")[,c(2,5,6,7,8,9,10)]/10000)
+sim.ref.4.11 <- matrix(0,40,7)
+colnames(sim.ref.4.11) <- c("B1","B2","B3","B4","B5","B6","B7")
+tts <- 54.266411
+for (i in 1:40) {
+  sim.ref.4.11[i,] <- sim_ref(Table_4_11[[i]],tts)
+}
+plot(as.vector(sim.ref.4.11),as.vector(ref_4_11),xlab="Simulated Reflectance",ylab="Observed Reflectance",main="Data of 2017-4-11")
+lines(seq(0,1,length=100),seq(0,1,length=100),col="red")
+
+#2017-06-14
+load("RDATA/2017-06-14.RData")
+Table_6_14 <- out
+ref_6_14 <- as.matrix(read.csv("509Data/2017-06-14.csv")[,c(2,5,6,7,8,9,10)]/10000)
+sim.ref.6.14 <- matrix(0,40,7)
+colnames(sim.ref.6.14) <- c("B1","B2","B3","B4","B5","B6","B7")
+tts <- 24.717606
+for (i in 1:40) {
+  sim.ref.6.14[i,] <- sim_ref(Table_6_14[[i]],tts)
+}
+plot(as.vector(sim.ref.6.14),as.vector(ref_6_14),xlab="Simulated Reflectance",ylab="Observed Reflectance",main="Data of 2017-6-14")
+lines(seq(0,1,length=100),seq(0,1,length=100),col="red")
+
+#2017-07-16
+load("RDATA/2017-07-16.RData")
+Table_7_16 <- out
+ref_7_16 <- as.matrix(read.csv("509Data/2017-07-16.csv")[,c(2,5,6,7,8,9,10)]/10000)
+sim.ref.7.16 <- matrix(0,40,7)
+colnames(sim.ref.7.16) <- c("B1","B2","B3","B4","B5","B6","B7")
+tts <- 27.115921
+for (i in 1:40) {
+  sim.ref.7.16[i,] <- sim_ref(Table_7_16[[i]],tts)
+}
+plot(as.vector(sim.ref.7.16),as.vector(ref_7_16),xlab="Simulated Reflectance",ylab="Observed Reflectance",main="Data of 2017-7-16")
+lines(seq(0,1,length=100),seq(0,1,length=100),col="red")
+
+#2017-10-20
+load("RDATA/2017-10-20.RData")
+Table_10_20 <- out
+ref_10_20 <- as.matrix(read.csv("509Data/2017-10-20.csv")[,c(2,5,6,7,8,9,10)]/10000)
+sim.ref.10.20 <- matrix(0,40,7)
+colnames(sim.ref.10.20) <- c("B1","B2","B3","B4","B5","B6","B7")
+tts <- 54.266411
+for (i in 1:40) {
+  sim.ref.10.20[i,] <- sim_ref(Table_10_20[[i]],tts)
+}
+plot(as.vector(sim.ref.10.20),as.vector(ref_10_20),xlab="Simulated Reflectance",ylab="Observed Reflectance",main="Data of 2017-10-20")
+lines(seq(0,1,length=100),seq(0,1,length=100),col="red")
+
+#2017-11-21
+load("RDATA/2017-11-21.RData")
+Table_11_21 <- out
+ref_11_21 <- as.matrix(read.csv("509Data/2017-11-21.csv")[,c(2,5,6,7,8,9,10)]/10000)
+sim.ref.11.21 <- matrix(0,40,7)
+colnames(sim.ref.11.21) <- c("B1","B2","B3","B4","B5","B6","B7")
+tts <- 63.551529
+for (i in 1:40) {
+  sim.ref.11.21[i,] <- sim_ref(Table_11_21[[i]],tts)
+}
+plot(as.vector(sim.ref.11.21),as.vector(ref_11_21),xlab="Simulated Reflectance",ylab="Observed Reflectance",main="Data of 2017-11-21")
+lines(seq(0,1,length=100),seq(0,1,length=100),col="red")
+#RMSE
+RMSE <- matrix(0,5,8)
+for (i in 1:7) {
+  RMSE[1,i] <- rmse(ref_4_11[i,],sim.ref.4.11[i,])
+  RMSE[2,i] <- rmse(ref_6_14[i,],sim.ref.6.14[i,])
+  RMSE[3,i] <- rmse(ref_7_16[i,],sim.ref.7.16[i,])
+  RMSE[4,i] <- rmse(ref_10_20[i,],sim.ref.10.20[i,])
+  RMSE[5,i] <- rmse(ref_11_21[i,],sim.ref.11.21[i,])
+}
+RMSE[1,8] <- rmse(ref_4_11,sim.ref.4.11)
+RMSE[2,8] <- rmse(ref_6_14,sim.ref.6.14)
+RMSE[3,8] <- rmse(ref_7_16,sim.ref.7.16)
+RMSE[4,8] <- rmse(ref_10_20,sim.ref.10.20)
+RMSE[5,8] <- rmse(ref_11_21,sim.ref.11.21)
+colnames(RMSE) <- c("B1","B2","B3","B4","B5","B6","B7","Overall")
+rownames(RMSE) <- c("4-11","6-14","7-16","10-20","11-21")
+write.csv(RMSE,file="RMSE.csv")
+```
+
+#Seasonal Change for each parameter
+```{r}
+getParam <- function(mcmc.list){
+  L <- length(mcmc.list)
+  Param <- list()
+  for (i in 1:40) {
+    temp.table <- mcmc.list[[i]]
+    Temp.param <- matrix(0,4,3)
+    for (j in 1:4) {
+      Temp.param[j,] <- quantile(temp.table$Z[,j],c(0.05,0.5,0.95))
+    }
+    Param[[i]] <- Temp.param
+  }
+  return(Param)
+}
+#Prior for LAI is (1,7); 
+#Prior for Cab is (0,40);
+#Prior for Cw is (0,0.03);
+#Prior for Cm is (0,0.03);
+Param.4.11 <- getParam(Table_4_11)
+Param.6.14 <- getParam(Table_6_14)
+Param.7.16 <- getParam(Table_7_16)
+Param.10.20 <- getParam(Table_10_20)
+Param.11.21 <- getParam(Table_11_21)
+
+#Analyze
+LAI.seq <- matrix(0,200,3)
+Cab.seq <- matrix(0,200,3)
+Cw.seq <- matrix(0,200,3)
+Cm.seq <- matrix(0,200,3)
+for (i in 1:40) {
+  #4-11
+  LAI.seq[i,] <- Param.4.11[[i]][1,]
+  Cab.seq[i,] <- Param.4.11[[i]][2,]
+  Cw.seq[i,] <- Param.4.11[[i]][3,]
+  Cm.seq[i,] <- Param.4.11[[i]][4,]
+  #6-14
+  LAI.seq[i+40,] <- Param.6.14[[i]][1,]
+  Cab.seq[i+40,] <- Param.6.14[[i]][2,]
+  Cw.seq[i+40,] <- Param.6.14[[i]][3,]
+  Cm.seq[i+40,] <- Param.6.14[[i]][4,]
+  #7-16
+  LAI.seq[i+80,] <- Param.7.16[[i]][1,]
+  Cab.seq[i+80,] <- Param.7.16[[i]][2,]
+  Cw.seq[i+80,] <- Param.7.16[[i]][3,]
+  Cm.seq[i+80,] <- Param.7.16[[i]][4,]
+  #10-20
+  LAI.seq[i+120,] <- Param.10.20[[i]][1,]
+  Cab.seq[i+120,] <- Param.10.20[[i]][2,]
+  Cw.seq[i+120,] <- Param.10.20[[i]][3,]
+  Cm.seq[i+120,] <- Param.10.20[[i]][4,]
+  #11-21
+  LAI.seq[i+160,] <- Param.11.21[[i]][1,]
+  Cab.seq[i+160,] <- Param.11.21[[i]][2,]
+  Cw.seq[i+160,] <- Param.11.21[[i]][3,]
+  Cm.seq[i+160,] <- Param.11.21[[i]][4,]
+}
+
+#LAI
+DOY <- seq(101,325,length=200)
+x <- seq(101,325,length=200)
+y <- LAI.seq[,2]
+plot(DOY,LAI.seq[,2],ylim=c(0.5,7),ylab="LAI Value",main="LAI")
+lines(lowess(x,y),col=2)
+lines(lowess(x,LAI.seq[,1]),col=3,lty=2)
+lines(lowess(x,LAI.seq[,3]),col=3,lty=2)
+legend(270,7,legend=c("Sim Value","Mean Value","CI"),pch=c(1,NA,NA,NA),lty=c(0,1,2,2),col=c(1,2,3,3))
+
+#Cab
+DOY <- seq(101,325,length=200)
+x <- seq(101,325,length=200)
+y <- Cab.seq[,2]
+plot(DOY,Cab.seq[,2],ylim=c(0,40),ylab="Cab Content",main="Cab")
+lines(lowess(x,y),col="red")
+lines(lowess(x,Cab.seq[,1]),col="green",lty=2)
+lines(lowess(x,Cab.seq[,3]),col="green",lty=2)
+legend(180,13,legend=c("Sim Value","Mean Value","CI"),pch=c(1,NA,NA,NA),lty=c(0,1,2,2),col=c(1,2,3,3))
+
+#Cw
+DOY <- seq(101,325,length=200)
+x <- seq(101,325,length=200)
+y <- Cw.seq[,2]
+plot(DOY,Cw.seq[,2],ylab="Cw Content",main="Cw")
+lines(lowess(x,y),col="red")
+lines(lowess(x,Cw.seq[,1]),col="green",lty=2)
+lines(lowess(x,Cw.seq[,3]),col="green",lty=2)
+legend(100,0.023,legend=c("Sim Value","Mean Value","CI"),pch=c(1,NA,NA,NA),lty=c(0,1,2,2),col=c(1,2,3,3))
+
+
+#Cm
+DOY <- seq(101,325,length=200)
+x <- seq(101,325,length=200)
+y <- Cm.seq[,2]
+plot(DOY,Cm.seq[,2],ylim=c(0,0.02),ylab="Cm content",main="Cm")
+lines(lowess(x,y),col="red")
+lines(lowess(x,Cm.seq[,1]),col="green",lty=2)
+lines(lowess(x,Cm.seq[,3]),col="green",lty=2)
+legend(100,0.0195,legend=c("Sim Value","Mean Value","CI"),pch=c(1,NA,NA,NA),lty=c(0,1,2,2),col=c(1,2,3,3))
+
+```
+
+#LAI validation
+```{r}
+LAI.ob <- read.csv("509Data/hf069-01-lai-plot.csv")
+index.4.20 <- which(LAI.ob[,3]==2017&LAI.ob[,1]==4&LAI.ob[,2]==20)
+LAI.4.20 <- LAI.ob[index.4.20,7]
+index.6.13 <- which(LAI.ob[,3]==2017&LAI.ob[,1]==6&LAI.ob[,2]==13)
+LAI.6.13 <- LAI.ob[index.6.13,7]
+index.7.11 <- which(LAI.ob[,3]==2017&LAI.ob[,1]==7&LAI.ob[,2]==11)
+LAI.7.11 <- LAI.ob[index.7.11,7]
+index.10.27 <- which(LAI.ob[,3]==2017&LAI.ob[,1]==10&LAI.ob[,2]==27)
+LAI.10.27 <- LAI.ob[index.10.27,7]
+index.11.29 <- which(LAI.ob[,3]==2017&LAI.ob[,1]==11&LAI.ob[,2]==29)
+LAI.11.29 <- LAI.ob[index.11.29,7]
+LAI.ob1 <- cbind(LAI.4.20,LAI.6.13,LAI.7.11,LAI.10.27,LAI.11.29)
+LAI <- as.vector(LAI.ob1)
+
+DOY <- seq(101,325,length=200)
+x <- seq(101,325,length=200)
+x.ob <- seq(101,325,length=205)
+y <- LAI.seq[,2]
+plot(DOY,LAI.seq[,2],ylim=c(0.5,7),ylab="LAI Values",main="LAI Validation")
+points(x.ob,LAI,col=2,pch=3)
+lines(lowess(x,y),col=3)
+lines(lowess(x,LAI.seq[,1]),col="green",lty=2)
+lines(lowess(x,LAI.seq[,3]),col="green",lty=2)
+lines(lowess(x.ob,LAI),col=4)
+legend(285,7,legend = c("LAI.ob","LAI.est","CI.est","Fit.ob","Fit.est"),
+       lty=c(0,0,2,1,1),pch = c(1,3,NA,NA,NA),col=c(1,2,3,3,4))
+```
+
+
+
+
+
